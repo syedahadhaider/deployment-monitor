@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  collector:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: collector
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --disable-pip-version-check -e ".[dev]"
+      - run: ruff check .
+      - run: mypy
+      # The tests are fully offline (httpx MockTransport), so CI never depends
+      # on the availability of the very sites this project monitors.
+      - run: pytest -q

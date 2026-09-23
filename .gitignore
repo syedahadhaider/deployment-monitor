@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Node / Wrangler
+node_modules/
+.wrangler/
+dist/
+
+# Local secrets - never commit. Wrangler secrets live in Cloudflare, and the
+# collector's token lives in GitHub Actions secrets.
+.dev.vars
+.env

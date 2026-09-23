@@ -1,0 +1,20 @@
+name = "deployment-monitor-api"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+# The D1 binding. `database_id` is filled in by `wrangler d1 create` - see the
+# setup steps in the repository README.
+[[d1_databases]]
+binding = "DB"
+database_name = "deployment-monitor"
+database_id = "REPLACE_WITH_DATABASE_ID"
+migrations_dir = "migrations"
+
+[vars]
+# Origins allowed to read /summary from a browser. The data is public, so this
+# is tidiness rather than a security boundary - the write endpoint is the one
+# that is actually guarded.
+ALLOWED_ORIGINS = "https://syedahadhaider.com"
+
+# INGEST_TOKEN is a SECRET and is never written here.
+#   wrangler secret put INGEST_TOKEN

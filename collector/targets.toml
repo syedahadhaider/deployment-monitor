@@ -1,0 +1,46 @@
+# The endpoints this monitor checks. Public information by design: anyone
+# reading the repo can see exactly what is watched and verify that nothing
+# private is being probed.
+#
+# `id` is the stable key the API joins on. It never changes once a target has
+# recorded checks - renaming it would orphan its history.
+
+[[target]]
+id = "portfolio"
+name = "Portfolio"
+url = "https://syedahadhaider.com/"
+
+[[target]]
+id = "ash-orbit"
+name = "Ash & Orbit"
+url = "https://ash-orbit.vercel.app/"
+
+[[target]]
+id = "hearth-and-hollow"
+name = "Hearth & Hollow"
+url = "https://hearthnhollow.vercel.app/"
+
+[[target]]
+id = "plinth"
+name = "PLINTH"
+url = "https://plinth-blush.vercel.app/"
+
+[[target]]
+id = "shynx-store"
+name = "Shynx Store"
+url = "https://shynx-store.vercel.app/"
+
+[[target]]
+id = "custom"
+name = "Custom"
+url = "https://custom-cyan.vercel.app/"
+
+[[target]]
+id = "material-studies"
+name = "Material Studies"
+url = "https://material-studies.vercel.app/"
+
+[[target]]
+id = "form-after"
+name = "FORM / AFTER"
+url = "https://form-after.vercel.app/"

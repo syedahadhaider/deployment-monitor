@@ -1,0 +1,48 @@
+name: availability check
+
+on:
+  schedule:
+    # Every 30 minutes. GitHub's scheduler is best-effort: runs are delayed
+    # under platform load and are sometimes skipped entirely. That is expected.
+    # The dashboard reports coverage (recorded / expected checks) separately
+    # from uptime precisely so a missed run reads as "the scheduler missed a
+    # tick", never as "the site was down".
+    - cron: "*/30 * * * *"
+  # So a run can be triggered by hand after a deploy, or to confirm the job
+  # still works after GitHub disables the schedule (see below).
+  workflow_dispatch:
+
+# A delayed run must never overlap the next one and post two batches for
+# what should be one interval.
+concurrency:
+  group: availability-check
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: collector
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install --disable-pip-version-check .
+
+      - name: Run checks and publish
+        env:
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
+          MONITOR_API_TOKEN: ${{ secrets.MONITOR_API_TOKEN }}
+        # Exits non-zero only when the MONITOR is broken (bad config, API
+        # unreachable or rejecting). A monitored site being down is a
+        # successful run that recorded a failure, and must stay green.
+        run: python -m monitor --verbose
