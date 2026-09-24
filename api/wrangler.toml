@@ -7,7 +7,7 @@ compatibility_date = "2026-09-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "deployment-monitor"
-database_id = "REPLACE_WITH_DATABASE_ID"
+database_id = "798654aa-e0ce-49a7-bd33-3629dac0bea6"
 migrations_dir = "migrations"
 
 [vars]

@@ -18,16 +18,22 @@ from collections import Counter
 from pathlib import Path
 
 from .check import run_checks
-from .config import ConfigError, load_settings, load_targets
+from .config import ConfigError, default_targets_path, load_settings, load_targets
 from .publish import PublishError, publish
-
-DEFAULT_TARGETS = Path(__file__).resolve().parents[2] / "targets.toml"
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="monitor", description=__doc__)
     parser.add_argument(
-        "--targets", type=Path, default=DEFAULT_TARGETS, help="path to targets.toml"
+        "--targets",
+        type=Path,
+        default=None,
+        help="path to a targets.toml (defaults to the one packaged with the collector)",
+    )
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="load and validate the targets file, print it, and exit without touching the network",
     )
     parser.add_argument(
         "--dry-run",
@@ -39,7 +45,19 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 async def _run(args: argparse.Namespace) -> int:
-    targets = load_targets(args.targets)
+    targets_path = args.targets or default_targets_path()
+    targets = load_targets(targets_path)
+
+    if args.check_config:
+        # Deliberately offline: this is the cheap, deterministic way to prove
+        # the collector can find and parse its own configuration, whatever the
+        # working directory and however it was installed.
+        print(f"targets file: {targets_path}")
+        for target in targets:
+            print(f"  {target.id:<20} {target.url}")
+        print(f"{len(targets)} enabled target(s)")
+        return 0
+
     logging.info("checking %d target(s)", len(targets))
 
     if args.dry_run:

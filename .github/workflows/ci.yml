@@ -15,8 +15,8 @@ jobs:
       run:
         working-directory: collector
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install --disable-pip-version-check -e ".[dev]"
@@ -25,3 +25,28 @@ jobs:
       # The tests are fully offline (httpx MockTransport), so CI never depends
       # on the availability of the very sites this project monitors.
       - run: pytest -q
+
+  # The job that would have caught the targets.toml bug. The test suite runs
+  # against an EDITABLE install, where walking up from __file__ still lands in
+  # the repo root - so a missing packaged file looks fine there. This builds a
+  # real wheel, installs it into a clean environment with no source tree in
+  # sight, and runs the CLI from an unrelated directory.
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Build a wheel
+        working-directory: collector
+        run: |
+          pip install --disable-pip-version-check build
+          python -m build --wheel .
+      - name: Install it somewhere else entirely
+        run: pip install --disable-pip-version-check collector/dist/*.whl
+      - name: Run from a directory with no source in it
+        run: |
+          mkdir -p /tmp/elsewhere
+          cd /tmp/elsewhere
+          python -m monitor --check-config
