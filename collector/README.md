@@ -5,13 +5,14 @@ a fixed list of public URLs, classifies any failure, and posts the batch to the
 write API in one authenticated request.
 
 ```
+python -m monitor --check-config   # find and validate the targets file, print it, exit
 python -m monitor --dry-run -v     # run the checks, print the payload, send nothing
 python -m monitor                  # run and publish (needs the two env vars)
 ```
 
 ## What it does
 
-For each target in [`targets.toml`](targets.toml), concurrently:
+For each target in [`targets.toml`](src/monitor/targets.toml), concurrently:
 
 1. `GET` the URL with a 10-second timeout, following redirects.
 2. Measure elapsed time to response with `perf_counter` (a monotonic clock, so
@@ -87,6 +88,18 @@ exactly what is watched and confirm nothing private is probed. Each `id` is a
 stable slug and must never be changed once it has recorded checks — renaming
 one orphans its history.
 
+It lives **inside the package**, at `src/monitor/targets.toml`, so it is
+installed alongside the code and is found via `importlib.resources` rather than
+by a relative path or by walking up from `__file__`. Those alternatives work in
+a source checkout and in an editable install, then break under a real
+`pip install .` — which is exactly how it failed in CI once. Pass `--targets`
+to use a different file:
+
+```bash
+python -m monitor --check-config                  # find, parse and print the config; no network
+python -m monitor --check-config --targets ./my-targets.toml
+```
+
 Credentials come only from the environment, never from a file:
 
 | Variable                  | Required | Purpose                                     |
@@ -137,5 +150,12 @@ mypy
 ```
 
 The tests cover the failure classification in depth, the retry semantics
-(one retry, one row), and the isolation guarantee that one broken target still
-yields a complete batch.
+(one retry, one row), the isolation guarantee that one broken target still
+yields a complete batch, and that the packaged `targets.toml` is found from any
+working directory and from an installed wheel.
+
+That last one has its own CI job. The test suite runs against an *editable*
+install, where walking up from `__file__` still lands in the repo root — so a
+file missing from the wheel looks fine there. The `wheel` job builds a real
+wheel, installs it into a clean environment and runs the CLI from an unrelated
+directory, which is the only way that class of bug shows up before production.

@@ -10,9 +10,13 @@ from __future__ import annotations
 import os
 import tomllib
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 
 from .models import Target
+
+#: Lives INSIDE the package, not beside it. See `default_targets_path`.
+TARGETS_FILENAME = "targets.toml"
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
@@ -24,6 +28,27 @@ INTERVAL_SECONDS = 1800
 
 class ConfigError(RuntimeError):
     """Raised when configuration is missing or unusable."""
+
+
+def default_targets_path() -> Path:
+    """Locate the packaged ``targets.toml``.
+
+    Derived from the package's own location via ``importlib.resources`` -- never
+    from the working directory, and never by walking up from ``__file__`` to a
+    source-tree layout. Those two approaches both break the moment the package
+    is installed rather than run from a checkout:
+
+    * a bare relative path depends on where the process happened to start;
+    * ``Path(__file__).parents[2]`` is the repository root in a source tree or
+      an editable install, but in a real wheel install it points at
+      ``site-packages/..``, i.e. the interpreter's ``lib`` directory.
+
+    The second is what broke CI: the workflow runs ``pip install .`` (not
+    ``-e .``), so the file has to travel INSIDE the package. It does -- it sits
+    next to this module and hatchling ships everything under ``src/monitor`` --
+    and this function finds it wherever that package ends up.
+    """
+    return Path(str(resources.files(__package__).joinpath(TARGETS_FILENAME)))
 
 
 @dataclass(frozen=True, slots=True)

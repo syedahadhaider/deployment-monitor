@@ -29,14 +29,22 @@ jobs:
       run:
         working-directory: collector
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Install
+        # A non-editable install on purpose: it is what runs in production, and
+        # it is the layout that exposed targets.toml not being packaged.
         run: pip install --disable-pip-version-check .
+
+      - name: Verify the collector can find its config
+        # Offline and instant. If the packaged targets.toml ever goes missing
+        # again, this fails here with a clear message instead of halfway
+        # through a scheduled run.
+        run: python -m monitor --check-config
 
       - name: Run checks and publish
         env:
