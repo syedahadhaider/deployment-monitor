@@ -82,6 +82,39 @@ npx wrangler secret put INGEST_TOKEN             # paste a long random string
 npx wrangler deploy
 ```
 
+**Scheduling** — GitHub Actions cron is best-effort and, on a low-activity
+repository, mostly does not fire: in the first nine hours here **one scheduled
+run landed out of roughly ten expected**, and that one was fifteen minutes
+late. The cron expression was never wrong; `*/30` simply asks for :00 and :30,
+the two most oversubscribed minutes on the platform.
+
+Two changes address it, and neither moves the checks out of Python:
+
+1. The schedule now asks for `7,37` instead of `*/30` — offset minutes are
+   measurably more likely to actually run.
+2. A **watchdog** on Cloudflare, whose cron *is* reliable. Every ten minutes it
+   asks the database one question — how old is the newest check? — and only if
+   a run has genuinely been skipped does it nudge the same workflow via
+   `repository_dispatch`. Python still performs every check; only the
+   *triggering* becomes dependable. Because it fires only when a run was
+   actually missed, it cannot double-collect, so coverage keeps meaning
+   exactly what it meant before.
+
+`repository_dispatch` also sidesteps the 60-day inactivity disable that
+silently stops `schedule:`.
+
+To enable the watchdog, create a **fine-grained PAT** scoped to this repository
+with *Contents: read and write* (the permission `POST /dispatches` requires),
+then:
+
+```bash
+cd api && npx wrangler secret put GITHUB_DISPATCH_TOKEN   # paste the PAT
+npx wrangler deploy                                       # registers the cron trigger
+```
+
+Leaving `GITHUB_DISPATCH_TOKEN` unset is supported: the watchdog disables
+itself and the collector simply runs on GitHub's own schedule, less reliably.
+
 **GitHub** — in this repository's *Settings → Secrets and variables → Actions*:
 
 | Secret | Value |
