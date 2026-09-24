@@ -25,6 +25,17 @@ export interface Env {
   INGEST_TOKEN: string;
   /** Comma-separated origins allowed to read /summary from a browser. */
   ALLOWED_ORIGINS?: string;
+  /**
+   * `owner/repo` whose workflow the watchdog nudges. Unset disables the
+   * watchdog entirely, which is a supported configuration - the collector
+   * still runs on GitHub's own schedule, just less reliably.
+   */
+  GITHUB_REPO?: string;
+  /**
+   * Fine-grained PAT with Contents: read and write on that repo, which is the
+   * permission `POST /dispatches` requires. Secret; never committed.
+   */
+  GITHUB_DISPATCH_TOKEN?: string;
 }
 
 // --- tuning, stated once and reported to the client ------------------------
@@ -65,6 +76,18 @@ const MAX_INCIDENTS = 50;
  * with it. The TTL is a correctness control, not just a speed one.
  */
 const CACHE_TTL_SECONDS = 600;
+
+/**
+ * How stale the newest recorded check may get before the watchdog steps in.
+ *
+ * Slightly under the collection interval: if GitHub's own cron fired on time,
+ * the newest row is only minutes old and the watchdog does nothing at all. It
+ * only acts once a scheduled run has demonstrably been skipped.
+ */
+const STALE_AFTER_SECONDS = 1500; // 25 minutes
+
+/** The event type the workflow listens for on `repository_dispatch`. */
+const DISPATCH_EVENT = 'run-checks';
 
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), {
@@ -286,8 +309,72 @@ async function summary(request: Request, env: Env, ctx: ExecutionContext): Promi
 }
 
 // ---------------------------------------------------------------------------
+// watchdog
+// ---------------------------------------------------------------------------
+
+/**
+ * Fill the gaps GitHub's scheduler leaves.
+ *
+ * GitHub Actions cron is best-effort and, on a low-activity repository, mostly
+ * does not run: in the first nine hours here, one scheduled tick fired out of
+ * roughly ten expected, and that one arrived fifteen minutes late. The `*​/30`
+ * expression was never the problem -- it asked for the two most oversubscribed
+ * minutes on the platform, and GitHub simply dropped the rest.
+ *
+ * The fix is deliberately NOT "move the checks into this Worker". The checks
+ * are Python on purpose. Instead this is a watchdog: Cloudflare's cron is
+ * reliable, so every ten minutes it asks the database one question -- how old
+ * is the newest check? -- and only if a run has actually been missed does it
+ * nudge the SAME GitHub workflow via `repository_dispatch`. Python still
+ * performs every check.
+ *
+ * Because it fires only when a run was genuinely skipped, it cannot produce a
+ * second collection alongside a healthy one, so coverage keeps meaning exactly
+ * what it meant before: how many of the expected checks really happened.
+ */
+async function watchdog(env: Env): Promise<void> {
+  if (!env.GITHUB_REPO || !env.GITHUB_DISPATCH_TOKEN) return;
+
+  const row = await env.DB.prepare('SELECT MAX(checked_at) AS last FROM checks').first<{
+    last: number | null;
+  }>();
+  const last = row?.last ?? 0;
+  const age = Math.floor(Date.now() / 1000) - last;
+
+  // Fresh enough: GitHub's own schedule did its job. Do nothing.
+  if (last > 0 && age < STALE_AFTER_SECONDS) return;
+
+  const response = await fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/dispatches`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.GITHUB_DISPATCH_TOKEN}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'Content-Type': 'application/json',
+      // GitHub rejects API requests without one.
+      'User-Agent': 'deployment-monitor-watchdog',
+    },
+    body: JSON.stringify({ event_type: DISPATCH_EVENT }),
+  });
+
+  if (!response.ok) {
+    // Logged, not thrown: a failed nudge must not look like a failed check.
+    // The consequence is simply that coverage keeps reporting the gap.
+    console.error(
+      `watchdog: dispatch failed ${response.status} ${(await response.text()).slice(0, 200)}`,
+    );
+    return;
+  }
+  console.log(`watchdog: newest check was ${age}s old, dispatched ${DISPATCH_EVENT}`);
+}
+
+// ---------------------------------------------------------------------------
 
 export default {
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(watchdog(env));
+  },
+
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 

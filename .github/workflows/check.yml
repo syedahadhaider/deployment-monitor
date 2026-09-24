@@ -7,7 +7,20 @@ on:
     # The dashboard reports coverage (recorded / expected checks) separately
     # from uptime precisely so a missed run reads as "the scheduler missed a
     # tick", never as "the site was down".
-    - cron: "*/30 * * * *"
+    #
+    # NOT "*/30 * * * *". That asks for :00 and :30 -- the two most
+    # oversubscribed minutes on GitHub's scheduler, where runs are most likely
+    # to be delayed or dropped outright. Offset minutes are measurably more
+    # likely to actually fire.
+    - cron: "7,37 * * * *"
+  # The watchdog. A Cloudflare Cron Trigger checks how old the newest recorded
+  # check is and fires this ONLY when GitHub has actually skipped a scheduled
+  # run -- so the checks stay in Python here, while scheduling stops depending
+  # on a best-effort queue. `repository_dispatch` is also immune to the 60-day
+  # inactivity disable that silently stops `schedule:`.
+  repository_dispatch:
+    types: [run-checks]
+
   # So a run can be triggered by hand after a deploy, or to confirm the job
   # still works after GitHub disables the schedule (see below).
   workflow_dispatch:

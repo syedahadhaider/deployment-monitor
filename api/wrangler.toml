@@ -16,5 +16,18 @@ migrations_dir = "migrations"
 # that is actually guarded.
 ALLOWED_ORIGINS = "https://syedahadhaider.com"
 
+# Repository the watchdog nudges. Leave unset to disable the watchdog.
+GITHUB_REPO = "syedahadhaider/deployment-monitor"
+
 # INGEST_TOKEN is a SECRET and is never written here.
 #   wrangler secret put INGEST_TOKEN
+
+# Watchdog schedule. Cloudflare's cron is reliable, so this ticks every ten
+# minutes, asks how old the newest recorded check is, and nudges the GitHub
+# workflow ONLY when a scheduled run has actually been missed. It never runs
+# the checks itself - those stay in Python on Actions.
+[triggers]
+crons = ["*/10 * * * *"]
+
+# GITHUB_DISPATCH_TOKEN is a SECRET and is never written here.
+#   wrangler secret put GITHUB_DISPATCH_TOKEN
