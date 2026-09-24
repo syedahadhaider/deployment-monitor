@@ -332,46 +332,107 @@ async function summary(request: Request, env: Env, ctx: ExecutionContext): Promi
  * second collection alongside a healthy one, so coverage keeps meaning exactly
  * what it meant before: how many of the expected checks really happened.
  */
-async function watchdog(env: Env): Promise<void> {
-  if (!env.GITHUB_REPO || !env.GITHUB_DISPATCH_TOKEN) return;
+interface WatchdogResult {
+  action: 'dispatched' | 'skipped_fresh' | 'not_configured' | 'dispatch_rejected' | 'threw';
+  detail: string;
+  last_checked_at: number | null;
+  age_seconds: number | null;
+  stale_after_seconds: number;
+  /** Never the token. Only whether one is present and how long it is. */
+  token: { present: boolean; length: number };
+  repo: string | null;
+  github_status?: number;
+  github_body?: string;
+}
 
-  const row = await env.DB.prepare('SELECT MAX(checked_at) AS last FROM checks').first<{
-    last: number | null;
-  }>();
-  const last = row?.last ?? 0;
-  const age = Math.floor(Date.now() / 1000) - last;
+async function watchdog(env: Env): Promise<WatchdogResult> {
+  // Length, never the value. This is precisely what distinguishes "the secret
+  // exists but is empty" from "the secret is fine" -- `wrangler secret list`
+  // shows only the name, so an empty value is otherwise invisible.
+  const token = env.GITHUB_DISPATCH_TOKEN ?? '';
+  const tokenInfo = { present: token.length > 0, length: token.length };
+  const repo = env.GITHUB_REPO ?? null;
 
-  // Fresh enough: GitHub's own schedule did its job. Do nothing.
-  if (last > 0 && age < STALE_AFTER_SECONDS) return;
+  const base: WatchdogResult = {
+    action: 'not_configured',
+    detail: '',
+    last_checked_at: null,
+    age_seconds: null,
+    stale_after_seconds: STALE_AFTER_SECONDS,
+    token: tokenInfo,
+    repo,
+  };
 
-  const response = await fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/dispatches`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${env.GITHUB_DISPATCH_TOKEN}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'Content-Type': 'application/json',
-      // GitHub rejects API requests without one.
-      'User-Agent': 'deployment-monitor-watchdog',
-    },
-    body: JSON.stringify({ event_type: DISPATCH_EVENT }),
-  });
-
-  if (!response.ok) {
-    // Logged, not thrown: a failed nudge must not look like a failed check.
-    // The consequence is simply that coverage keeps reporting the gap.
-    console.error(
-      `watchdog: dispatch failed ${response.status} ${(await response.text()).slice(0, 200)}`,
-    );
-    return;
+  if (!repo || !token) {
+    // Previously this returned silently, which is why a bad token looked
+    // identical to a healthy watchdog: zero dispatches and zero logs.
+    base.detail = !repo
+      ? 'GITHUB_REPO is not set'
+      : `GITHUB_DISPATCH_TOKEN is missing or empty (length ${token.length})`;
+    console.error(`watchdog: not configured - ${base.detail}`);
+    return base;
   }
-  console.log(`watchdog: newest check was ${age}s old, dispatched ${DISPATCH_EVENT}`);
+
+  try {
+    const row = await env.DB.prepare('SELECT MAX(checked_at) AS last FROM checks').first<{
+      last: number | null;
+    }>();
+    const last = row?.last ?? 0;
+    const age = Math.floor(Date.now() / 1000) - last;
+    base.last_checked_at = last || null;
+    base.age_seconds = last ? age : null;
+
+    if (last > 0 && age < STALE_AFTER_SECONDS) {
+      base.action = 'skipped_fresh';
+      base.detail = `newest check is ${age}s old, under the ${STALE_AFTER_SECONDS}s threshold`;
+      console.log(`watchdog: ${base.detail}`);
+      return base;
+    }
+
+    const response = await fetch(`https://api.github.com/repos/${repo}/dispatches`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'Content-Type': 'application/json',
+        // GitHub rejects API requests without one.
+        'User-Agent': 'deployment-monitor-watchdog',
+      },
+      body: JSON.stringify({ event_type: DISPATCH_EVENT }),
+    });
+
+    base.github_status = response.status;
+    // 204 No Content on success, so a body only exists on failure.
+    base.github_body = (await response.text()).slice(0, 300);
+
+    if (!response.ok) {
+      base.action = 'dispatch_rejected';
+      base.detail = `GitHub returned ${response.status}`;
+      // Logged, not thrown: a failed nudge must not look like a failed check.
+      console.error(`watchdog: dispatch rejected ${response.status} ${base.github_body}`);
+      return base;
+    }
+
+    base.action = 'dispatched';
+    base.detail = `newest check was ${age}s old; dispatched '${DISPATCH_EVENT}' to ${repo}`;
+    console.log(`watchdog: ${base.detail}`);
+    return base;
+  } catch (error) {
+    base.action = 'threw';
+    base.detail = (error as Error).message;
+    console.error(`watchdog: threw - ${base.detail}`);
+    return base;
+  }
 }
 
 // ---------------------------------------------------------------------------
 
 export default {
-  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    // Logged before anything can return early, so "the cron never fired" and
+    // "the cron fired and decided to do nothing" are never confusable again.
+    console.log(`watchdog: scheduled tick (cron ${event.cron})`);
     ctx.waitUntil(watchdog(env));
   },
 
@@ -394,6 +455,19 @@ export default {
     if (url.pathname === '/summary' && request.method === 'GET') {
       return summary(request, env, ctx);
     }
+    // Same bearer token as /ingest. Runs the watchdog now and returns exactly
+    // what it decided and why -- including the GitHub status and body when a
+    // dispatch is rejected. The token itself is never returned or logged, only
+    // whether one is present and its length.
+    if (url.pathname === '/watchdog/run' && request.method === 'POST') {
+      const header = request.headers.get('Authorization') ?? '';
+      const supplied = header.startsWith('Bearer ') ? header.slice(7) : '';
+      if (!env.INGEST_TOKEN || !supplied || !timingSafeEqual(supplied, env.INGEST_TOKEN)) {
+        return json({ error: 'unauthorized' }, 401, { 'WWW-Authenticate': 'Bearer' });
+      }
+      return json(await watchdog(env), 200, { 'Cache-Control': 'no-store' });
+    }
+
     if (url.pathname === '/health' && request.method === 'GET') {
       return json({ ok: true }, 200, corsHeaders(request, env));
     }
