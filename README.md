@@ -103,17 +103,40 @@ Two changes address it, and neither moves the checks out of Python:
 `repository_dispatch` also sidesteps the 60-day inactivity disable that
 silently stops `schedule:`.
 
-To enable the watchdog, create a **fine-grained PAT** scoped to this repository
-with *Contents: read and write* (the permission `POST /dispatches` requires),
-then:
+To enable the watchdog, create a **fine-grained PAT**:
+
+| Setting | Value |
+| --- | --- |
+| Repository access | Only select repositories -> `syedahadhaider/deployment-monitor` |
+| Repository permissions | **Contents: Read and write** |
+| (auto-added) | Metadata: Read-only |
+
+`Contents: Read and write` is what `POST /repos/{owner}/{repo}/dispatches`
+requires. A classic PAT works too, with the `repo` scope.
+
+Then set it. **Prefer the dashboard**: Workers & Pages -> `deployment-monitor-api`
+-> Settings -> Variables and Secrets -> Add, type `Secret`, name
+`GITHUB_DISPATCH_TOKEN`. The interactive `wrangler secret put` prompt does not
+capture typed input in some Windows terminals — it returns instantly and stores
+an **empty** value, and `wrangler secret list` still shows the name, so nothing
+looks wrong. If you use the CLI, pipe the value and verify afterwards:
 
 ```bash
-cd api && npx wrangler secret put GITHUB_DISPATCH_TOKEN   # paste the PAT
-npx wrangler deploy                                       # registers the cron trigger
+cd api
+echo "<the-pat>" | npx wrangler secret put GITHUB_DISPATCH_TOKEN
+npx wrangler deploy
+
+# Confirm it actually took. Reports presence and LENGTH, never the value:
+curl -s -X POST https://<your-worker>.workers.dev/watchdog/run   -H "Authorization: Bearer <INGEST_TOKEN>" | jq
 ```
 
+A healthy reply is `"action": "dispatched"` or `"skipped_fresh"`.
+`"not_configured"` with `"token": {"present": false, "length": 0}` means the
+secret is empty.
+
 Leaving `GITHUB_DISPATCH_TOKEN` unset is supported: the watchdog disables
-itself and the collector simply runs on GitHub's own schedule, less reliably.
+itself — and now says so in the logs on every tick — and the collector simply
+runs on GitHub's own schedule, less reliably.
 
 **GitHub** — in this repository's *Settings → Secrets and variables → Actions*:
 

@@ -4,10 +4,19 @@ Two endpoints. One authenticated writer, one public cached reader. Every
 aggregation is SQL.
 
 ```
-POST /ingest    bearer auth, validates and rejects, parameterised writes
-GET  /summary   public, cached 600s, fully aggregated
-GET  /health    liveness
+POST /ingest         bearer auth, validates and rejects, parameterised writes
+GET  /summary        public, cached 600s, fully aggregated
+POST /watchdog/run   bearer auth, runs the watchdog now and reports its decision
+GET  /health         liveness
 ```
+
+`/watchdog/run` exists because a watchdog that declines to act is
+indistinguishable from one that is broken. It returns the action taken
+(`dispatched`, `skipped_fresh`, `not_configured`, `dispatch_rejected`,
+`threw`), the age of the newest check against the threshold, GitHub's status
+and body when a dispatch is rejected, and whether a token is present **with its
+length only** — never the value. That last field is the one that matters: an
+empty secret and a healthy one look identical to `wrangler secret list`.
 
 ## Why the backend lives here
 
