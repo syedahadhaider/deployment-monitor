@@ -82,7 +82,7 @@ const CACHE_TTL_SECONDS = 600;
  * outlive a Worker deployment, so the request URL alone is not a safe cache
  * key across response-schema changes.
  */
-const SUMMARY_CACHE_VERSION = '2';
+const SUMMARY_CACHE_VERSION = '3';
 
 /**
  * Where a slot starts, in seconds past the hour.
