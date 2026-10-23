@@ -71,10 +71,18 @@ All five live in [`src/queries.ts`](src/queries.ts) and all are parameterised;
 there is no string-concatenated SQL anywhere in this project.
 
 1. **Uptime** — `ok / (ok + failed)` per target over the window.
-2. **Coverage** — `recorded / expected`, where expected comes from the window
-   length divided by the cadence stored on the rows. Reported **separately**
-   from uptime. Low coverage means the scheduler missed runs; it never means a
-   site was down.
+2. **Coverage** — `slots covered / slots expected`. A slot is one period of the
+   cadence, aligned to the cron minutes the workflow asks for (:07 and :37); it
+   is covered if it holds at least one check, however many it holds. Only slots
+   that have fully ended inside the window are counted, so the slot in progress
+   is neither covered nor missed. Reported **separately** from uptime. Low
+   coverage means the scheduler missed runs; it never means a site was down.
+
+   It counted *samples* until 24 October — `recorded / expected`, clamped to 1
+   — which let a duplicate run pay for a missed one. The live data read 100%
+   coverage from 348 checks against 336 expected while only 330 of 335 slots
+   had actually been served. `slots_expected`, `slots_covered` and `extra_runs`
+   are returned alongside it so the surplus is visible rather than absorbed.
 3. **Latency p50/p95** — `ROW_NUMBER()` ranking, nearest-rank, over successful
    checks only (a timeout would otherwise enter the distribution as the timeout
    *setting*, not a measurement). **Gated in SQL at 50 samples**: below that the

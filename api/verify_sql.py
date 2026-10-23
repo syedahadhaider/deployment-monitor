@@ -22,6 +22,9 @@ SCHEMA = (HERE / "migrations" / "0001_init.sql").read_text(encoding="utf-8")
 QUERIES = (HERE / "src" / "queries.ts").read_text(encoding="utf-8")
 
 INTERVAL = 1800  # 30 minutes
+# Slots are aligned to the cron minutes the workflow asks for (:07 and :37),
+# so the phase is 7*60 seconds past the hour. SUMMARY_SQL takes it as ?4.
+SLOT_PHASE = 420
 GAP_TOLERANCE = 2  # a tick inside 2 intervals is "next"; beyond that is a gap
 MIN_SAMPLES = 50
 
@@ -70,6 +73,11 @@ def add(con: sqlite3.Connection, target: str, at: int, status: str, latency: int
     )
 
 
+def summary(con: sqlite3.Connection, since: int, until: int) -> list[sqlite3.Row]:
+    """Run the shipped SUMMARY_SQL with the parameters the Worker binds."""
+    return con.execute(sql("SUMMARY_SQL"), (since, until, INTERVAL, SLOT_PHASE)).fetchall()
+
+
 def incidents(con: sqlite3.Connection, since: int, until: int) -> list[sqlite3.Row]:
     return con.execute(sql("INCIDENTS_SQL"), (since, until, GAP_TOLERANCE, 50)).fetchall()
 
@@ -79,6 +87,15 @@ print("\n1. an incident terminates at a scheduler gap")
 # ---------------------------------------------------------------------------
 con = fresh()
 t = 1_700_000_000
+
+# The slot boundary at or before `t`, and the start of the nth slot after it.
+# Windows in the coverage sections start exactly on a boundary so the expected
+# counts are the ones a reader can work out by hand.
+base = t - (t - SLOT_PHASE) % INTERVAL
+
+
+def slot_start(n: int) -> int:
+    return base + n * INTERVAL
 add(con, "a", t + 0 * INTERVAL, "ok", 100)
 add(con, "a", t + 1 * INTERVAL, "failed", kind="timeout")
 add(con, "a", t + 2 * INTERVAL, "failed", kind="timeout")
@@ -158,19 +175,21 @@ check("different targets", sorted(r["target_id"] for r in rows), ["a", "b"])
 print("\n6. uptime and coverage are independent")
 # ---------------------------------------------------------------------------
 con = fresh()
-# 24 ticks expected over 12 hours; only 12 actually ran, and 3 of those failed.
+# 24 slots expected over 12 hours; only 12 of them ran, and 3 of those failed.
+# The window starts on a slot boundary so all 24 slots end inside it.
 window = 12 * 3600
 for i in range(12):
-    add(con, "a", t + i * INTERVAL, "ok" if i % 4 else "failed", 100, kind="timeout")
-rows = con.execute(sql("SUMMARY_SQL"), (t, t + window, INTERVAL)).fetchall()
+    add(con, "a", slot_start(i) + 60, "ok" if i % 4 else "failed", 100, kind="timeout")
+rows = summary(con, base, base + window)
 row = next(r for r in rows if r["target_id"] == "a")
 check("recorded what actually ran", row["checks_recorded"], 12)
 check("expected comes from the cadence", row["checks_expected"], 24)
+check("and so does the slot expectation", row["slots_expected"], 24)
 check("ok count", row["ok_count"], 9)
 check("failed count", row["failed_count"], 3)
 check("uptime is of checks that RAN (9/12)", round(row["ok_count"] / row["checks_recorded"], 4), 0.75)
 check("coverage is a separate fraction (12/24)",
-      round(row["checks_recorded"] / row["checks_expected"], 4), 0.5)
+      round(row["slots_covered"] / row["slots_expected"], 4), 0.5)
 
 b_row = next(r for r in rows if r["target_id"] == "b")
 check("a target with no checks still returns a row", b_row["checks_recorded"], 0)
@@ -244,6 +263,91 @@ for _ in range(3):
     con.execute(sql("INSERT_CHECK_SQL"), ("a", t, "ok", 200, 100, None, None, INTERVAL))
 check("three identical inserts produce one row",
       con.execute("SELECT COUNT(*) c FROM checks").fetchone()["c"], 1)
+
+# ---------------------------------------------------------------------------
+print("\n11. coverage counts slots, not samples")
+# ---------------------------------------------------------------------------
+# Every window below starts exactly on a slot boundary, so the arithmetic in
+# the test is the arithmetic a reader can do in their head: `slots` whole slots
+# fit, and the last one is still open at `until`, so it is excluded.
+con = fresh()
+# Slot 0 holds TWO checks; slot 1 holds one. Four slots fully end in the window.
+add(con, "a", slot_start(0) + 60, "ok", 100)
+add(con, "a", slot_start(0) + 1500, "ok", 100)   # a duplicate run, same slot
+add(con, "a", slot_start(1) + 60, "ok", 100)
+add(con, "a", slot_start(2) + 60, "ok", 100)
+add(con, "a", slot_start(3) + 60, "ok", 100)
+rows = summary(con, base, slot_start(5))
+row = next(r for r in rows if r["target_id"] == "a")
+check("two checks in one slot count as one covered slot", row["slots_covered"], 4)
+check("...and the duplicate is still visible as extra_runs", row["extra_runs"], 1)
+check("...while checks_recorded keeps counting samples", row["checks_recorded"], 5)
+check("five whole slots end inside the window", row["slots_expected"], 5)
+check("so coverage is 4/5, not 5/5", round(row["slots_covered"] / row["slots_expected"], 4), 0.8)
+
+# ---------------------------------------------------------------------------
+print("\n12. a duplicate cannot pay for a missed slot")
+# ---------------------------------------------------------------------------
+# This is the live bug in miniature: as many samples as slots expected, but one
+# slot never ran. The old formula (recorded / expected) read 100%.
+con = fresh()
+for i in (0, 1, 2):
+    add(con, "a", slot_start(i) + 60, "ok", 100)
+add(con, "a", slot_start(2) + 1500, "ok", 100)   # the extra run
+# slot 3 is MISSED entirely
+rows = summary(con, base, slot_start(4))
+row = next(r for r in rows if r["target_id"] == "a")
+check("samples equal the expectation", row["checks_recorded"], row["slots_expected"])
+check("the old formula would have read 100%",
+      round(min(row["checks_recorded"] / row["checks_expected"], 1), 4), 1.0)
+check("slots tell the truth: 3 of 4", row["slots_covered"], 3)
+check("so coverage is 75%, not 100%",
+      round(row["slots_covered"] / row["slots_expected"], 4), 0.75)
+check("and the surplus run is named", row["extra_runs"], 1)
+
+# ---------------------------------------------------------------------------
+print("\n13. a slot still open at the window edge is excluded")
+# ---------------------------------------------------------------------------
+con = fresh()
+add(con, "a", slot_start(0) + 60, "ok", 100)
+add(con, "a", slot_start(1) + 60, "ok", 100)
+# `until` lands in the middle of slot 2, which has a check but has not ended.
+rows = summary(con, base, slot_start(2) + 900)
+row = next(r for r in rows if r["target_id"] == "a")
+check("only the ended slots are expected", row["slots_expected"], 2)
+check("the open slot is not counted as covered", row["slots_covered"], 2)
+check("an unfinished slot is neither covered nor missed",
+      round(row["slots_covered"] / row["slots_expected"], 4), 1.0)
+
+con = fresh()
+add(con, "a", slot_start(0) + 60, "ok", 100)
+# A check in the open slot must not inflate anything either.
+add(con, "a", slot_start(1) + 60, "ok", 100)
+rows = summary(con, base, slot_start(1) + 900)
+row = next(r for r in rows if r["target_id"] == "a")
+check("the check inside the open slot is excluded from coverage", row["slots_covered"], 1)
+check("...though it is still a recorded sample", row["checks_recorded"], 2)
+
+# ---------------------------------------------------------------------------
+print("\n14. an empty window gives null coverage, never 0")
+# ---------------------------------------------------------------------------
+con = fresh()
+add(con, "a", slot_start(0) + 60, "ok", 100)
+# A window too short to contain a single completed slot.
+rows = summary(con, base, base + 600)
+row = next(r for r in rows if r["target_id"] == "a")
+check("no slot has ended, so none is expected", row["slots_expected"], 0)
+check("the Worker divides only when the denominator is > 0",
+      (row["slots_covered"] / row["slots_expected"]) if row["slots_expected"] > 0 else None, None)
+
+# A target with no rows at all, over a window that does contain whole slots.
+rows = summary(con, base, slot_start(4))
+b_row = next(r for r in rows if r["target_id"] == "b")
+check("a target with no checks still returns a row", b_row["checks_recorded"], 0)
+check("...with 0 covered out of a real expectation", b_row["slots_covered"], 0)
+check("...which is 0% coverage, and that is the honest figure",
+      round(b_row["slots_covered"] / b_row["slots_expected"], 4), 0.0)
+check("...and no phantom extra runs", b_row["extra_runs"], 0)
 
 print()
 if failures:

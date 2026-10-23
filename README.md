@@ -51,7 +51,17 @@ checks or it shows an empty state.
 **Uptime and coverage are different questions and are never mixed:**
 
 - **Uptime** — of the checks that *ran*, how many passed.
-- **Coverage** — of the checks that *should have* run, how many actually did.
+- **Coverage** — of the schedule's *slots*, how many held at least one check.
+
+Coverage counts **slots, not samples**. A slot is one period of the cadence,
+aligned to the cron minutes the workflow asks for (:07 and :37), and it counts
+once however many runs landed in it. That distinction is not academic: it used
+to be `recorded / expected`, counting rows, so a slot that ran twice silently
+paid for a slot that never ran at all. Over one seven-day window that read
+**100% while 5 of 335 slots had genuinely been missed** — 348 checks against
+336 expected, with 17 duplicate runs covering the gap. Only slots that have
+fully ended inside the window are counted; the one in progress is neither
+covered nor missed.
 
 GitHub Actions cron is best-effort: runs are delayed and sometimes skipped
 entirely. Those are the *scheduler's* gaps. A missing check is missing
@@ -93,12 +103,25 @@ Two changes address it, and neither moves the checks out of Python:
 1. The schedule now asks for `7,37` instead of `*/30` — offset minutes are
    measurably more likely to actually run.
 2. A **watchdog** on Cloudflare, whose cron *is* reliable. Every ten minutes it
-   asks the database one question — how old is the newest check? — and only if
-   a run has genuinely been skipped does it nudge the same workflow via
-   `repository_dispatch`. Python still performs every check; only the
-   *triggering* becomes dependable. Because it fires only when a run was
-   actually missed, it cannot double-collect, so coverage keeps meaning
-   exactly what it meant before.
+   asks the database one question — does the slot in progress hold a check
+   yet? — and only if that slot is already 20 minutes old and still empty does
+   it nudge the same workflow via `repository_dispatch`. Python still performs
+   every check; only the *triggering* becomes dependable.
+
+   **It can double-collect, and it did.** Earlier it triggered on the age of
+   the newest check with a threshold of 25 minutes — below the 30-minute
+   cadence — so it fired five minutes *before* the next scheduled run was even
+   due. Over seven days that produced 17 slots holding both a dispatched run
+   and the scheduled run it pre-empted. Triggering on the slot instead of on an
+   age cannot pre-empt the next run, because it never looks past the current
+   slot. A duplicate is still possible when GitHub's own run arrives after the
+   watchdog has given up on a slot — measured lateness here reaches 29m31s —
+   but that no longer distorts the figure: the slot counts once, and the
+   surplus is reported separately as `extra_runs`.
+
+   On this repository the watchdog is not a backstop but the **primary**
+   scheduler: in the same window GitHub's cron fired 41 of 336 expected ticks
+   and the watchdog fired 326.
 
 `repository_dispatch` also sidesteps the 60-day inactivity disable that
 silently stops `schedule:`.

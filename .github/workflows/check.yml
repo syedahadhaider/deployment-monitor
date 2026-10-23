@@ -4,20 +4,27 @@ on:
   schedule:
     # Every 30 minutes. GitHub's scheduler is best-effort: runs are delayed
     # under platform load and are sometimes skipped entirely. That is expected.
-    # The dashboard reports coverage (recorded / expected checks) separately
+    # The dashboard reports coverage (covered slots / expected slots) separately
     # from uptime precisely so a missed run reads as "the scheduler missed a
-    # tick", never as "the site was down".
+    # tick", never as "the site was down". Slots, not samples: a slot counts
+    # once however many runs land in it, so a duplicate cannot pay for a slot
+    # that never ran.
     #
     # NOT "*/30 * * * *". That asks for :00 and :30 -- the two most
     # oversubscribed minutes on GitHub's scheduler, where runs are most likely
     # to be delayed or dropped outright. Offset minutes are measurably more
     # likely to actually fire.
     - cron: "7,37 * * * *"
-  # The watchdog. A Cloudflare Cron Trigger checks how old the newest recorded
-  # check is and fires this ONLY when GitHub has actually skipped a scheduled
-  # run -- so the checks stay in Python here, while scheduling stops depending
-  # on a best-effort queue. `repository_dispatch` is also immune to the 60-day
-  # inactivity disable that silently stops `schedule:`.
+  # The watchdog. A Cloudflare Cron Trigger asks whether the slot in progress
+  # holds a check yet, and fires this only once that slot is 20 minutes old and
+  # still empty -- so the checks stay in Python here, while scheduling stops
+  # depending on a best-effort queue. It is the primary trigger in practice:
+  # GitHub's own cron fired 41 of 336 expected ticks in the last seven days.
+  # It CAN land in the same slot as a late scheduled run; coverage counts the
+  # slot once and reports the surplus as extra_runs.
+  #
+  # `repository_dispatch` is also immune to the 60-day inactivity disable that
+  # silently stops `schedule:`.
   repository_dispatch:
     types: [run-checks]
 

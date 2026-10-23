@@ -78,13 +78,48 @@ const MAX_INCIDENTS = 50;
 const CACHE_TTL_SECONDS = 600;
 
 /**
- * How stale the newest recorded check may get before the watchdog steps in.
+ * Where a slot starts, in seconds past the hour.
  *
- * Slightly under the collection interval: if GitHub's own cron fired on time,
- * the newest row is only minutes old and the watchdog does nothing at all. It
- * only acts once a scheduled run has demonstrably been skipped.
+ * The workflow asks for `7,37 * * * *`, so slots begin at :07 and :37 and the
+ * phase is 7*60. Coverage and the watchdog both align to this, so a check
+ * always belongs to the same slot however it was triggered.
  */
-const STALE_AFTER_SECONDS = 1500; // 25 minutes
+const SLOT_PHASE_SECONDS = 420;
+
+/**
+ * How far into a slot the watchdog waits before filling it.
+ *
+ * THE PREVIOUS VALUE WAS A BUG. It was 1500s measured from the newest check,
+ * described as firing "only once a scheduled run has demonstrably been
+ * skipped". It did the opposite: at a 1800s cadence a check at T made the
+ * watchdog dispatch at T+1500, five minutes BEFORE the next scheduled run was
+ * even due. Measured over seven days that produced 17 slots holding both a
+ * dispatched run and the scheduled run it pre-empted.
+ *
+ * It is also why the cadence held up at all: because the trigger was an age
+ * since the last check, the cadence it produced equalled the threshold. Simply
+ * raising the threshold to "interval + grace" would therefore have pushed every
+ * subsequent check later too, stretching the cadence to 45-55 minutes and
+ * dropping real coverage to around 60% -- on this repository GitHub's own cron
+ * fired just 41 of 336 expected ticks, so the watchdog is the primary
+ * scheduler, not a backstop.
+ *
+ * So the trigger is now the SLOT, not the age. The watchdog fires only when the
+ * slot in progress still holds no check and is already this old. That cannot
+ * pre-empt the next slot, because it never looks past the current one.
+ *
+ * 1200s is chosen against the tick phase, not picked round. Cloudflare's cron
+ * runs every ten minutes on the hour, so inside a slot starting at :07 the
+ * ticks land at +180s, +780s and +1380s. A threshold of 1200s qualifies exactly
+ * one of them (+1380s, 23 minutes in), leaving ~7 minutes for the dispatched run
+ * to land inside its own slot. Raising it past 1380 would mean no tick ever
+ * qualifies and the watchdog would never fire at all.
+ *
+ * It also gives GitHub's own run 23 minutes to show up first; the measured
+ * median lateness of a scheduled run here is 12m39s, so most arrive well before
+ * the watchdog considers the slot abandoned.
+ */
+const SLOT_FILL_AFTER_SECONDS = 1200; // 20 minutes into a 30-minute slot
 
 /** The event type the workflow listens for on `repository_dispatch`. */
 const DISPATCH_EVENT = 'run-checks';
@@ -204,6 +239,9 @@ interface SummaryRow {
   last_failure_kind: string | null;
   interval_seconds: number | null;
   checks_expected: number;
+  slots_expected: number;
+  slots_covered: number;
+  extra_runs: number;
 }
 
 interface LatencyRow {
@@ -232,7 +270,7 @@ async function summary(request: Request, env: Env, ctx: ExecutionContext): Promi
     // Four statements, four indexed range scans over the same window. Each one
     // returns finished aggregates; no raw check rows ever cross this boundary.
     const batched = await env.DB.batch([
-      env.DB.prepare(SUMMARY_SQL).bind(since, now, DEFAULT_INTERVAL_SECONDS),
+      env.DB.prepare(SUMMARY_SQL).bind(since, now, DEFAULT_INTERVAL_SECONDS, SLOT_PHASE_SECONDS),
       env.DB.prepare(LATENCY_SQL).bind(since, now, MIN_LATENCY_SAMPLES),
       env.DB.prepare(INCIDENTS_SQL).bind(since, now, GAP_TOLERANCE_INTERVALS, MAX_INCIDENTS),
       env.DB.prepare(SERIES_SQL).bind(since, now, BUCKET_SECONDS),
@@ -270,12 +308,20 @@ async function summary(request: Request, env: Env, ctx: ExecutionContext): Promi
       const lat = latencyById.get(row.target_id);
       const recorded = row.checks_recorded;
       const expected = Math.max(row.checks_expected, 0);
+      const slotsExpected = Math.max(row.slots_expected, 0);
+      const slotsCovered = Math.max(row.slots_covered, 0);
       return {
         id: row.target_id,
         name: row.name,
         url: row.url,
         checks_recorded: recorded,
         checks_expected: expected,
+        // Slots, and the runs beyond the first in one. extra_runs > 0 with
+        // coverage < 1 is the shape the old formula hid: duplicate runs paying
+        // for missed ones.
+        slots_expected: slotsExpected,
+        slots_covered: slotsCovered,
+        extra_runs: Math.max(row.extra_runs, 0),
         ok_count: row.ok_count,
         failed_count: row.failed_count,
         // Ratios are the only arithmetic done here, and only because a
@@ -283,7 +329,11 @@ async function summary(request: Request, env: Env, ctx: ExecutionContext): Promi
         // were computed in SQL. `null` when there is nothing to divide -
         // never 0, which would read as "totally down" / "no coverage".
         uptime: recorded > 0 ? row.ok_count / recorded : null,
-        coverage: expected > 0 ? Math.min(recorded / expected, 1) : null,
+        // Slots covered, not samples recorded. No Math.min is needed or wanted:
+        // the numerator is DISTINCT slots drawn from the same bounded range as
+        // the denominator, so it cannot exceed it, and clamping would hide it
+        // if it ever did.
+        coverage: slotsExpected > 0 ? slotsCovered / slotsExpected : null,
         last_checked_at: row.last_checked_at,
         last_status: row.last_status,
         last_http_status: row.last_http_status,
@@ -328,16 +378,42 @@ async function summary(request: Request, env: Env, ctx: ExecutionContext): Promi
  * nudge the SAME GitHub workflow via `repository_dispatch`. Python still
  * performs every check.
  *
- * Because it fires only when a run was genuinely skipped, it cannot produce a
- * second collection alongside a healthy one, so coverage keeps meaning exactly
- * what it meant before: how many of the expected checks really happened.
+ * IT CAN produce a second collection alongside a healthy one, and for seven
+ * days it did: 17 slots held both a dispatched run and the scheduled run it
+ * fired ahead of. The old trigger was an age since the newest check, set below
+ * the collection interval, so it went off before the next scheduled run was
+ * due. The claim that previously stood here -- that it "cannot produce a second
+ * collection alongside a healthy one" -- was wrong, and coverage counting
+ * samples rather than slots is what kept it from showing.
+ *
+ * It now fires on the SLOT instead: at most one dispatch per slot, and only
+ * when that slot is already SLOT_FILL_AFTER_SECONDS old and still holds no
+ * check. Two dispatches in one slot are not reachable in practice -- the first
+ * one's run writes its checks within a couple of minutes and the next tick is
+ * ten minutes later, by which point the slot is no longer empty.
+ *
+ * A duplicate is still possible when GitHub's own scheduled run arrives after
+ * the watchdog has already given up on the slot: measured lateness here runs to
+ * 29m31s at worst. That is now harmless to the figure, because coverage counts
+ * the slot once however many runs landed in it, and the surplus is reported
+ * separately as extra_runs.
  */
 interface WatchdogResult {
-  action: 'dispatched' | 'skipped_fresh' | 'not_configured' | 'dispatch_rejected' | 'threw';
+  action:
+    | 'dispatched'
+    | 'skipped_fresh'
+    | 'skipped_slot_young'
+    | 'not_configured'
+    | 'dispatch_rejected'
+    | 'threw';
   detail: string;
   last_checked_at: number | null;
   age_seconds: number | null;
-  stale_after_seconds: number;
+  /** Start of the slot in progress, and how far into it this tick is. */
+  slot_started_at: number | null;
+  slot_age_seconds: number | null;
+  slot_has_check: boolean | null;
+  slot_fill_after_seconds: number;
   /** Never the token. Only whether one is present and how long it is. */
   token: { present: boolean; length: number };
   repo: string | null;
@@ -358,7 +434,10 @@ async function watchdog(env: Env): Promise<WatchdogResult> {
     detail: '',
     last_checked_at: null,
     age_seconds: null,
-    stale_after_seconds: STALE_AFTER_SECONDS,
+    slot_started_at: null,
+    slot_age_seconds: null,
+    slot_has_check: null,
+    slot_fill_after_seconds: SLOT_FILL_AFTER_SECONDS,
     token: tokenInfo,
     repo,
   };
@@ -374,17 +453,44 @@ async function watchdog(env: Env): Promise<WatchdogResult> {
   }
 
   try {
-    const row = await env.DB.prepare('SELECT MAX(checked_at) AS last FROM checks').first<{
-      last: number | null;
-    }>();
-    const last = row?.last ?? 0;
-    const age = Math.floor(Date.now() / 1000) - last;
-    base.last_checked_at = last || null;
-    base.age_seconds = last ? age : null;
+    const now = Math.floor(Date.now() / 1000);
+    // The slot in progress, on the same phase the coverage query uses.
+    const slotStart =
+      Math.floor((now - SLOT_PHASE_SECONDS) / DEFAULT_INTERVAL_SECONDS) * DEFAULT_INTERVAL_SECONDS +
+      SLOT_PHASE_SECONDS;
+    const slotAge = now - slotStart;
 
-    if (last > 0 && age < STALE_AFTER_SECONDS) {
+    // One statement, two facts: the newest check anywhere (for the log and the
+    // response) and whether THIS slot already holds one. Bound parameter, as
+    // everywhere else in this project.
+    const row = await env.DB
+      .prepare(
+        'SELECT MAX(checked_at) AS last, ' +
+          'SUM(CASE WHEN checked_at >= ?1 THEN 1 ELSE 0 END) AS in_slot FROM checks',
+      )
+      .bind(slotStart)
+      .first<{ last: number | null; in_slot: number | null }>();
+
+    const last = row?.last ?? 0;
+    const inSlot = (row?.in_slot ?? 0) > 0;
+    base.last_checked_at = last || null;
+    base.age_seconds = last ? now - last : null;
+    base.slot_started_at = slotStart;
+    base.slot_age_seconds = slotAge;
+    base.slot_has_check = inSlot;
+
+    if (inSlot) {
       base.action = 'skipped_fresh';
-      base.detail = `newest check is ${age}s old, under the ${STALE_AFTER_SECONDS}s threshold`;
+      base.detail = `slot started ${slotAge}s ago already holds a check`;
+      console.log(`watchdog: ${base.detail}`);
+      return base;
+    }
+
+    if (slotAge < SLOT_FILL_AFTER_SECONDS) {
+      // The slot is empty but young: GitHub's own run may still be on its way,
+      // and firing now is what used to pre-empt it.
+      base.action = 'skipped_slot_young';
+      base.detail = `slot is ${slotAge}s old, under the ${SLOT_FILL_AFTER_SECONDS}s fill threshold`;
       console.log(`watchdog: ${base.detail}`);
       return base;
     }
@@ -415,7 +521,9 @@ async function watchdog(env: Env): Promise<WatchdogResult> {
     }
 
     base.action = 'dispatched';
-    base.detail = `newest check was ${age}s old; dispatched '${DISPATCH_EVENT}' to ${repo}`;
+    base.detail =
+      `slot started ${slotAge}s ago was still empty; ` +
+      `dispatched '${DISPATCH_EVENT}' to ${repo}`;
     console.log(`watchdog: ${base.detail}`);
     return base;
   } catch (error) {

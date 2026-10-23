@@ -12,12 +12,31 @@
  * Per target: availability, coverage and freshness over the window.
  *
  * Uptime and coverage are deliberately two different fractions:
- *   uptime   = ok / (ok + failed)  - of the checks that RAN, how many passed
- *   coverage = recorded / expected - how many of the checks that SHOULD have
- *                                    run actually did
- * Expected comes from the cadence stored on the rows themselves. A scheduler
- * that skipped half its ticks produces low coverage and leaves uptime
- * untouched, which is the only honest way to report it.
+ *   uptime   = ok / (ok + failed)        - of the checks that RAN, how many passed
+ *   coverage = slots covered / expected  - how many of the schedule's slots got
+ *                                          at least one check
+ *
+ * COVERAGE COUNTS SLOTS, NOT SAMPLES. It used to be recorded / expected, which
+ * counted rows: a slot that ran twice silently paid for a slot that never ran
+ * at all, so the figure read 100% while runs were genuinely being missed. On
+ * the live data that was 349 checks against 336 expected -- reported as 100%
+ * -- while only 332 of the schedule's slots actually held a check. The
+ * sentence the dashboard prints, "low coverage means my scheduler missed
+ * runs", was false under the old formula. It is true under this one.
+ *
+ * A SLOT is one period of the collection cadence, aligned to the cron minutes
+ * the workflow actually asks for (:07 and :37, so the phase is 7*60 = 420s
+ * past the hour, passed in as ?4). Aligning to the cron rather than to the
+ * window's own start matters: the window start moves every time /summary is
+ * requested, so window-relative slots would shift under the data and a run
+ * could change which slot it belongs to between two reads of the same figure.
+ * The cron phase is fixed, so a given check is always in the same slot.
+ *
+ * Only slots that have FULLY ENDED inside the window are counted. The slot
+ * containing the window's start is usually clipped and the slot containing
+ * "now" is still open; neither is covered nor missed, so both are excluded.
+ * That is why a 7-day window at a 30-minute cadence expects 335 slots rather
+ * than 336 whenever the window edge does not land exactly on a slot boundary.
  *
  * The LEFT JOIN from `targets` matters: a target with no checks at all in the
  * window still returns a row, with zero counts and NULL last_checked_at. It is
@@ -49,6 +68,34 @@ latest AS (
     FROM scoped
   )
   WHERE rn = 1
+),
+-- The slot range this window can actually judge, per target, at that target's
+-- own cadence. first_slot is a ceiling so a slot clipped by the window start is
+-- excluded; last_slot subtracts one so the slot still in progress at ?2 is too.
+bounds AS (
+  SELECT
+    t.id                                                                     AS target_id,
+    COALESCE(a.interval_seconds, ?3)                                         AS iv,
+    ((?1 - ?4) + COALESCE(a.interval_seconds, ?3) - 1)
+      / COALESCE(a.interval_seconds, ?3)                                     AS first_slot,
+    ((?2 - ?4) / COALESCE(a.interval_seconds, ?3)) - 1                       AS last_slot
+  FROM targets t
+  LEFT JOIN agg a ON a.target_id = t.id
+  WHERE t.enabled = 1
+),
+-- One row per target: how many distinct slots hold at least one check, and how
+-- many checks fell inside those slots. The difference between the two is the
+-- number of runs beyond the first in a slot -- the duplicates that used to be
+-- able to disguise a missed slot.
+slots AS (
+  SELECT
+    s.target_id                                        AS target_id,
+    COUNT(DISTINCT (s.checked_at - ?4) / b.iv)         AS slots_covered,
+    COUNT(*)                                           AS checks_in_slots
+  FROM scoped s
+  JOIN bounds b ON b.target_id = s.target_id
+  WHERE (s.checked_at - ?4) / b.iv BETWEEN b.first_slot AND b.last_slot
+  GROUP BY s.target_id
 )
 SELECT
   t.id                                   AS target_id,
@@ -64,12 +111,20 @@ SELECT
   l.failure_kind                         AS last_failure_kind,
   a.interval_seconds                     AS interval_seconds,
   -- Expected ticks in the window at the cadence the data was collected at.
-  -- Falls back to the caller-supplied default only when the target has no rows
-  -- to read a cadence from.
-  CAST((?2 - ?1) / COALESCE(a.interval_seconds, ?3) AS INTEGER) AS checks_expected
+  -- Kept for backward compatibility: it is a count of SAMPLES, and it is the
+  -- denominator coverage no longer uses.
+  CAST((?2 - ?1) / COALESCE(a.interval_seconds, ?3) AS INTEGER) AS checks_expected,
+  -- The coverage denominator: slots that fully ended inside the window.
+  CAST(MAX(b.last_slot - b.first_slot + 1, 0) AS INTEGER)       AS slots_expected,
+  CAST(COALESCE(sl.slots_covered, 0) AS INTEGER)                AS slots_covered,
+  -- Runs beyond the first in a slot. Never negative: checks_in_slots counts the
+  -- same rows slots_covered is distinct over.
+  CAST(COALESCE(sl.checks_in_slots, 0) - COALESCE(sl.slots_covered, 0) AS INTEGER) AS extra_runs
 FROM targets t
-LEFT JOIN agg    a ON a.target_id = t.id
-LEFT JOIN latest l ON l.target_id = t.id
+LEFT JOIN agg    a  ON a.target_id  = t.id
+LEFT JOIN latest l  ON l.target_id  = t.id
+LEFT JOIN bounds b  ON b.target_id  = t.id
+LEFT JOIN slots  sl ON sl.target_id = t.id
 WHERE t.enabled = 1
 ORDER BY t.name
 `;
