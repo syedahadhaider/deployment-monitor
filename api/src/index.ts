@@ -78,6 +78,13 @@ const MAX_INCIDENTS = 50;
 const CACHE_TTL_SECONDS = 600;
 
 /**
+ * Bump when the meaning or shape of /summary changes. Cache API entries can
+ * outlive a Worker deployment, so the request URL alone is not a safe cache
+ * key across response-schema changes.
+ */
+const SUMMARY_CACHE_VERSION = '2';
+
+/**
  * Where a slot starts, in seconds past the hour.
  *
  * The workflow asks for `7,37 * * * *`, so slots begin at :07 and :37 and the
@@ -254,7 +261,9 @@ interface LatencyRow {
 
 async function summary(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const cache = caches.default;
-  const cacheKey = new Request(new URL(request.url).toString(), { method: 'GET' });
+  const cacheUrl = new URL(request.url);
+  cacheUrl.searchParams.set('__cache_version', SUMMARY_CACHE_VERSION);
+  const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' });
   const hit = await cache.match(cacheKey);
   if (hit) return hit;
 
