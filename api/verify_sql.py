@@ -74,8 +74,9 @@ def add(con: sqlite3.Connection, target: str, at: int, status: str, latency: int
 
 
 def summary(con: sqlite3.Connection, since: int, until: int) -> list[sqlite3.Row]:
-    """Run the shipped SUMMARY_SQL with the parameters the Worker binds."""
-    return con.execute(sql("SUMMARY_SQL"), (since, until, INTERVAL, SLOT_PHASE)).fetchall()
+    """Run SUMMARY_SQL with REAL parameters, matching D1's JavaScript binds."""
+    params = (float(since), float(until), float(INTERVAL), float(SLOT_PHASE))
+    return con.execute(sql("SUMMARY_SQL"), params).fetchall()
 
 
 def incidents(con: sqlite3.Connection, since: int, until: int) -> list[sqlite3.Row]:

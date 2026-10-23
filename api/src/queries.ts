@@ -76,9 +76,15 @@ bounds AS (
   SELECT
     t.id                                                                     AS target_id,
     COALESCE(a.interval_seconds, ?3)                                         AS iv,
-    ((?1 - ?4) + COALESCE(a.interval_seconds, ?3) - 1)
-      / COALESCE(a.interval_seconds, ?3)                                     AS first_slot,
-    ((?2 - ?4) / COALESCE(a.interval_seconds, ?3)) - 1                       AS last_slot
+    CAST(
+      ((?1 - ?4) + COALESCE(a.interval_seconds, ?3) - 1)
+        / COALESCE(a.interval_seconds, ?3)
+      AS INTEGER
+    )                                                                         AS first_slot,
+    CAST(
+      (?2 - ?4) / COALESCE(a.interval_seconds, ?3)
+      AS INTEGER
+    ) - 1                                                                     AS last_slot
   FROM targets t
   LEFT JOIN agg a ON a.target_id = t.id
   WHERE t.enabled = 1
@@ -90,11 +96,12 @@ bounds AS (
 slots AS (
   SELECT
     s.target_id                                        AS target_id,
-    COUNT(DISTINCT (s.checked_at - ?4) / b.iv)         AS slots_covered,
+    COUNT(DISTINCT CAST((s.checked_at - ?4) / b.iv AS INTEGER)) AS slots_covered,
     COUNT(*)                                           AS checks_in_slots
   FROM scoped s
   JOIN bounds b ON b.target_id = s.target_id
-  WHERE (s.checked_at - ?4) / b.iv BETWEEN b.first_slot AND b.last_slot
+  WHERE CAST((s.checked_at - ?4) / b.iv AS INTEGER)
+        BETWEEN b.first_slot AND b.last_slot
   GROUP BY s.target_id
 )
 SELECT
