@@ -11,11 +11,15 @@
 
 import {
   ENABLED_TARGETS_SQL,
-  INCIDENTS_SQL,
   INSERT_CHECK_SQL,
-  LATENCY_SQL,
   SERIES_SQL,
+  SUMMARY_CACHE_GET_SQL,
+  SUMMARY_CACHE_PUT_SQL,
   SUMMARY_SQL,
+  WATCHDOG_LAST_CHECK_SQL,
+  WATCHDOG_SLOT_FILLED_SQL,
+  incidentsSql,
+  latencySql,
 } from './queries';
 import { ValidationError, timingSafeEqual, validateBatch } from './validate';
 
@@ -76,6 +80,52 @@ const MAX_INCIDENTS = 50;
  * with it. The TTL is a correctness control, not just a speed one.
  */
 const CACHE_TTL_SECONDS = 600;
+
+/**
+ * Where the slot containing `at` begins, on the cron phase.
+ *
+ * Used by the watchdog to decide whether the slot in progress already holds a
+ * check, and by `cachePeriodStart` below, which rounds the same grid down to
+ * the cache period. One definition of the boundary for both, so the cache
+ * cannot disagree with the watchdog about which slot a check belongs to.
+ */
+function slotStartFor(at: number): number {
+  return (
+    Math.floor((at - SLOT_PHASE_SECONDS) / DEFAULT_INTERVAL_SECONDS) *
+      DEFAULT_INTERVAL_SECONDS +
+    SLOT_PHASE_SECONDS
+  );
+}
+
+/**
+ * How many collection slots one cached summary covers.
+ *
+ * The floor is 1: the data cannot change inside a slot, so recomputing more
+ * often than once a slot spends quota to produce a byte-identical answer. The
+ * reason it is 2 rather than 1 is arithmetic, measured on the live database.
+ * One recomputation reads ~20,750 rows, so at one per slot a day of 48 costs
+ * 997,000 - under the 1,000,000 budget with nothing left over, and a single
+ * failing target adds 3,083 per recomputation and pushes it over. At two slots
+ * the same day costs ~499,000, a failing target ~573,000, and even all eight
+ * targets failing for a week stays near 1,090,000, which is 22% of the free
+ * tier. The cost of that headroom is up to an hour of staleness in a dashboard
+ * whose underlying data is half an hour granular, and `last_checked_at` is an
+ * absolute timestamp, so the page reports its own age honestly either way.
+ */
+const SUMMARY_CACHE_SLOTS = 2;
+
+/**
+ * Start of the cache period containing `at`, aligned to the slot grid.
+ *
+ * Aligned rather than a rolling TTL from the last write: a rolling window would
+ * let a request arriving just before a batch lands pin a stale payload for a
+ * further period.
+ */
+function cachePeriodStart(at: number): number {
+  const slot = Math.floor((at - SLOT_PHASE_SECONDS) / DEFAULT_INTERVAL_SECONDS);
+  const period = Math.floor(slot / SUMMARY_CACHE_SLOTS) * SUMMARY_CACHE_SLOTS;
+  return period * DEFAULT_INTERVAL_SECONDS + SLOT_PHASE_SECONDS;
+}
 
 /**
  * Bump when the meaning or shape of /summary changes. Cache API entries can
@@ -249,6 +299,12 @@ interface SummaryRow {
   slots_expected: number;
   slots_covered: number;
   extra_runs: number;
+  /**
+   * Percentile inputs for this target, counted in the same grouped pass.
+   * Decides whether the target appears in LATENCY_SQL's bound list at all,
+   * which is what lets that query use one window spec instead of two.
+   */
+  latency_samples: number;
 }
 
 interface LatencyRow {
@@ -268,29 +324,111 @@ async function summary(request: Request, env: Env, ctx: ExecutionContext): Promi
   if (hit) return hit;
 
   const now = Math.floor(Date.now() / 1000);
+  const periodStart = cachePeriodStart(now);
+
+  // Second cache layer, in the database.
+  //
+  // The Cache API above is per-colo, so it cannot bound how often the summary
+  // is recomputed: every colo that serves a request misses its own cache and
+  // recomputes. That is what put this account over D1's daily read quota, and
+  // D1 refuses WRITES once the quota is gone -- so the dashboard's read cost
+  // was costing the collector its data.
+  //
+  // This layer is one row, read by primary key, shared by every colo. It is
+  // keyed on the collection slot grid rather than a wall clock: the collector
+  // writes one batch per slot, so recomputing inside a period spends quota to
+  // produce a byte-identical answer. See SUMMARY_CACHE_SLOTS for why the
+  // period is two slots and not one.
+  try {
+    const cached = await env.DB.prepare(SUMMARY_CACHE_GET_SQL)
+      .bind(SUMMARY_CACHE_VERSION, periodStart)
+      .first<{ payload: string; computed_at: number }>();
+    if (cached?.payload) {
+      // Served verbatim rather than parsed and re-serialised: `generated_at`
+      // inside it is the instant it was computed, which is the honest answer
+      // to "how fresh is this".
+      const fromDb = new Response(cached.payload, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': `public, max-age=${CACHE_TTL_SECONDS}, s-maxage=${CACHE_TTL_SECONDS}`,
+          ...corsHeaders(request, env),
+        },
+      });
+      ctx.waitUntil(cache.put(cacheKey, fromDb.clone()));
+      return fromDb;
+    }
+  } catch (error) {
+    // A cache miss must never be fatal. Fall through and recompute.
+    console.error(`summary: cache read failed - ${(error as Error).message}`);
+  }
+
   const since = now - WINDOW_SECONDS;
 
   let targets: SummaryRow[];
-  let latency: LatencyRow[];
-  let incidents: Record<string, unknown>[];
+  let latency: LatencyRow[] = [];
+  let incidents: Record<string, unknown>[] = [];
   let series: Record<string, unknown>[];
 
   try {
-    // Four statements, four indexed range scans over the same window. Each one
-    // returns finished aggregates; no raw check rows ever cross this boundary.
-    const batched = await env.DB.batch([
-      env.DB.prepare(SUMMARY_SQL).bind(since, now, DEFAULT_INTERVAL_SECONDS, SLOT_PHASE_SECONDS),
-      env.DB.prepare(LATENCY_SQL).bind(since, now, MIN_LATENCY_SAMPLES),
-      env.DB.prepare(INCIDENTS_SQL).bind(since, now, GAP_TOLERANCE_INTERVALS, MAX_INCIDENTS),
+    // PHASE 1. One grouped pass over the window, which also decides what else
+    // has to run at all. That is the point of doing it first: a window holding
+    // no failed check has no incidents to find, and INCIDENTS_SQL is the most
+    // expensive query here (26,655 rows read) precisely because it has to walk
+    // every row in the window with LAG/LEAD to tell a run of failures from a
+    // scheduler gap. Skipping it when `failed_count` is zero everywhere is not
+    // an approximation: its `failures` CTE would be empty, so it would return
+    // no rows anyway.
+    const first = await env.DB.prepare(SUMMARY_SQL)
+      .bind(since, now, DEFAULT_INTERVAL_SECONDS, SLOT_PHASE_SECONDS)
+      .all<SummaryRow>();
+    targets = first.results ?? [];
+
+    // Targets that have percentile inputs, with the sample count already
+    // counted in phase 1 -- so LATENCY_SQL ranks the window once instead of
+    // ranking it and counting it.
+    const wanted = targets.filter((row) => row.latency_samples > 0);
+    // Only targets that actually failed in the window can produce an incident,
+    // and INCIDENTS_SQL partitions by target_id throughout, so restricting it
+    // to these is exact rather than approximate.
+    const failing = targets.filter((row) => row.failed_count > 0);
+
+    // PHASE 2. Whatever is left, in one round trip.
+    const rest: D1PreparedStatement[] = [
       env.DB.prepare(SERIES_SQL).bind(since, now, BUCKET_SECONDS),
-    ]);
-    if (batched.length !== 4) throw new Error('unexpected D1 batch result shape');
+    ];
+    let latencyAt = -1;
+    let incidentsAt = -1;
+    if (wanted.length > 0) {
+      latencyAt =
+        rest.push(
+          env.DB.prepare(latencySql(wanted.length)).bind(
+            since,
+            now,
+            MIN_LATENCY_SAMPLES,
+            ...wanted.flatMap((row) => [row.target_id, row.latency_samples]),
+          ),
+        ) - 1;
+    }
+    if (failing.length > 0) {
+      incidentsAt =
+        rest.push(
+          env.DB.prepare(incidentsSql(failing.length)).bind(
+            since,
+            now,
+            GAP_TOLERANCE_INTERVALS,
+            MAX_INCIDENTS,
+            ...failing.map((row) => row.target_id),
+          ),
+        ) - 1;
+    }
+
+    const batched = await env.DB.batch(rest);
     const rowsAt = (index: number): Record<string, unknown>[] =>
       (batched[index]?.results ?? []) as unknown as Record<string, unknown>[];
-    targets = rowsAt(0) as unknown as SummaryRow[];
-    latency = rowsAt(1) as unknown as LatencyRow[];
-    incidents = rowsAt(2);
-    series = rowsAt(3);
+    series = rowsAt(0);
+    if (latencyAt >= 0) latency = rowsAt(latencyAt) as unknown as LatencyRow[];
+    if (incidentsAt >= 0) incidents = rowsAt(incidentsAt);
   } catch (error) {
     // A D1 failure - including the free tier's daily row limit - must degrade
     // to a stated "unavailable", never to a page implying everything is down.
@@ -359,11 +497,29 @@ async function summary(request: Request, env: Env, ctx: ExecutionContext): Promi
     series,
   };
 
-  const response = json(payload, 200, {
-    'Cache-Control': `public, max-age=${CACHE_TTL_SECONDS}, s-maxage=${CACHE_TTL_SECONDS}`,
-    ...corsHeaders(request, env),
+  const body = JSON.stringify(payload);
+  const response = new Response(body, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': `public, max-age=${CACHE_TTL_SECONDS}, s-maxage=${CACHE_TTL_SECONDS}`,
+      ...corsHeaders(request, env),
+    },
   });
   ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  // Written after responding, so a cache write can never delay or fail a
+  // request. A lost write costs one extra recomputation, nothing more.
+  ctx.waitUntil(
+    env.DB.prepare(SUMMARY_CACHE_PUT_SQL)
+      .bind(SUMMARY_CACHE_VERSION, periodStart, body, now)
+      .run()
+      .then(
+        () => undefined,
+        (error: Error) => {
+          console.error(`summary: cache write failed - ${error.message}`);
+        },
+      ),
+  );
   return response;
 }
 
@@ -464,24 +620,29 @@ async function watchdog(env: Env): Promise<WatchdogResult> {
   try {
     const now = Math.floor(Date.now() / 1000);
     // The slot in progress, on the same phase the coverage query uses.
-    const slotStart =
-      Math.floor((now - SLOT_PHASE_SECONDS) / DEFAULT_INTERVAL_SECONDS) * DEFAULT_INTERVAL_SECONDS +
-      SLOT_PHASE_SECONDS;
+    const slotStart = slotStartFor(now);
     const slotAge = now - slotStart;
 
-    // One statement, two facts: the newest check anywhere (for the log and the
-    // response) and whether THIS slot already holds one. Bound parameter, as
-    // everywhere else in this project.
-    const row = await env.DB
-      .prepare(
-        'SELECT MAX(checked_at) AS last, ' +
-          'SUM(CASE WHEN checked_at >= ?1 THEN 1 ELSE 0 END) AS in_slot FROM checks',
-      )
-      .bind(slotStart)
-      .first<{ last: number | null; in_slot: number | null }>();
+    // TWO statements, one row each, in one round trip.
+    //
+    // This was a single statement -- MAX(checked_at) alongside a SUM(CASE ...)
+    // over the same table -- and that cost 13,512 rows on every tick, 144
+    // times a day, growing by ~370 a day: 1.9 million reads a day out of a
+    // 5 million daily allowance, to answer two questions whose answers are one
+    // row each. SQLite satisfies a bare MAX() from the tail of an index, but
+    // adding a conditional count to the same statement forces a full pass over
+    // it; EXISTS stops at the first matching row. Measured after the split: one
+    // row each, and neither grows with the table.
+    const [lastResult, slotResult] = await env.DB.batch<{
+      last: number | null;
+      in_slot: number | null;
+    }>([
+      env.DB.prepare(WATCHDOG_LAST_CHECK_SQL),
+      env.DB.prepare(WATCHDOG_SLOT_FILLED_SQL).bind(slotStart),
+    ]);
 
-    const last = row?.last ?? 0;
-    const inSlot = (row?.in_slot ?? 0) > 0;
+    const last = lastResult?.results?.[0]?.last ?? 0;
+    const inSlot = (slotResult?.results?.[0]?.in_slot ?? 0) > 0;
     base.last_checked_at = last || null;
     base.age_seconds = last ? now - last : null;
     base.slot_started_at = slotStart;

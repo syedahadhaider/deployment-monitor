@@ -4,8 +4,25 @@
  * series and the incidents are all computed by the database and arrive at the
  * Worker already in their final shape.
  *
- * All five queries are parameterised. There is no string interpolation of any
- * caller-controlled value anywhere in this file.
+ * All queries are parameterised. There is no string interpolation of any
+ * caller-controlled value anywhere in this file. LATENCY_SQL builds a VALUES
+ * list whose LENGTH varies with the number of targets; the generated text is
+ * placeholders only (`(?4, ?5), (?6, ?7), ...`) and every value is still bound.
+ *
+ * READ COST IS A CORRECTNESS CONCERN HERE, not just a performance one. D1 bills
+ * rows SCANNED and the free tier stops accepting WRITES once the daily read
+ * quota is gone -- so an expensive read query does not merely run slowly, it
+ * eventually costs the collector its data. Measured on the live database at
+ * 13,512 rows:
+ *
+ *   SUMMARY_SQL    33,884 -> 4,159 rows read   (one grouped pass, not four)
+ *   LATENCY_SQL    16,402 -> 12,328            (one window spec, not two)
+ *   INCIDENTS_SQL  26,655 -> 0 when the window holds no failed check
+ *   SERIES_SQL      4,270 unchanged            (rewrites measured worse)
+ *
+ * Every one of these is bounded by the WINDOW, never by the table, so the cost
+ * stays flat as history accumulates. `api/explain_plans.py` is the gate: it
+ * fails if any shipped query plans as a SCAN of `checks`.
  */
 
 /**
@@ -41,14 +58,28 @@
  * The LEFT JOIN from `targets` matters: a target with no checks at all in the
  * window still returns a row, with zero counts and NULL last_checked_at. It is
  * reported as "no data", never as down.
+ *
+ * ONE PASS over the window. This used to be four CTEs -- `scoped`, `agg`,
+ * `latest`, `bounds`, `slots` -- each of which made SQLite re-read the window,
+ * costing 33,884 rows to aggregate 2,048. Everything a target needs is now a
+ * single GROUP BY, and "the newest check" is three point lookups that ride
+ * (target_id, checked_at) backwards and read one row each. MATERIALIZED hints
+ * were tried first and measured WORSE (24,468 at best), which is why the shape
+ * changed instead.
+ *
+ * The slot grid uses each row's OWN `interval_seconds`, which is the column's
+ * stated purpose: a row keeps the cadence it was really collected at. The
+ * previous form used MIN(interval_seconds) across the target's window for
+ * every row of it, so the two differ only for a target whose window spans a
+ * cadence CHANGE -- no such row exists, and the cadence is stored per row
+ * precisely so old rows are not reinterpreted. `slots_expected` still uses the
+ * window-wide COALESCE(MIN(interval_seconds), ?3), unchanged.
+ *
+ * `latency_samples` is carried here so LATENCY_SQL does not need a second pass
+ * over the window just to count its own inputs.
  */
 export const SUMMARY_SQL = `
-WITH scoped AS (
-  SELECT target_id, status, checked_at, http_status, failure_kind, interval_seconds
-  FROM checks
-  WHERE checked_at >= ?1 AND checked_at <= ?2
-),
-agg AS (
+WITH agg AS (
   SELECT
     target_id,
     COUNT(*)                                            AS checks_recorded,
@@ -56,53 +87,28 @@ agg AS (
     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)  AS failed_count,
     MIN(checked_at)                                     AS first_checked_at,
     MAX(checked_at)                                     AS last_checked_at,
-    MIN(interval_seconds)                               AS interval_seconds
-  FROM scoped
+    MIN(interval_seconds)                               AS interval_seconds,
+    -- Slots this target actually covered, and how many checks fell inside
+    -- them. The difference is the number of runs beyond the first in a slot.
+    COUNT(DISTINCT CASE
+      WHEN CAST((checked_at - ?4) / interval_seconds AS INTEGER)
+           BETWEEN CAST(((?1 - ?4) + interval_seconds - 1) / interval_seconds AS INTEGER)
+               AND CAST((?2 - ?4) / interval_seconds AS INTEGER) - 1
+      THEN CAST((checked_at - ?4) / interval_seconds AS INTEGER)
+    END)                                                AS slots_covered,
+    SUM(CASE
+      WHEN CAST((checked_at - ?4) / interval_seconds AS INTEGER)
+           BETWEEN CAST(((?1 - ?4) + interval_seconds - 1) / interval_seconds AS INTEGER)
+               AND CAST((?2 - ?4) / interval_seconds AS INTEGER) - 1
+      THEN 1 ELSE 0
+    END)                                                AS checks_in_slots,
+    -- Percentile inputs, counted here so LATENCY_SQL need not re-read the
+    -- window to discover its own sample size.
+    SUM(CASE WHEN status = 'ok' AND latency_ms IS NOT NULL THEN 1 ELSE 0 END)
+                                                        AS latency_samples
+  FROM checks
+  WHERE checked_at >= ?1 AND checked_at <= ?2
   GROUP BY target_id
-),
-latest AS (
-  SELECT target_id, status, http_status, failure_kind
-  FROM (
-    SELECT target_id, status, http_status, failure_kind,
-           ROW_NUMBER() OVER (PARTITION BY target_id ORDER BY checked_at DESC) AS rn
-    FROM scoped
-  )
-  WHERE rn = 1
-),
--- The slot range this window can actually judge, per target, at that target's
--- own cadence. first_slot is a ceiling so a slot clipped by the window start is
--- excluded; last_slot subtracts one so the slot still in progress at ?2 is too.
-bounds AS (
-  SELECT
-    t.id                                                                     AS target_id,
-    COALESCE(a.interval_seconds, ?3)                                         AS iv,
-    CAST(
-      ((?1 - ?4) + COALESCE(a.interval_seconds, ?3) - 1)
-        / COALESCE(a.interval_seconds, ?3)
-      AS INTEGER
-    )                                                                         AS first_slot,
-    CAST(
-      (?2 - ?4) / COALESCE(a.interval_seconds, ?3)
-      AS INTEGER
-    ) - 1                                                                     AS last_slot
-  FROM targets t
-  LEFT JOIN agg a ON a.target_id = t.id
-  WHERE t.enabled = 1
-),
--- One row per target: how many distinct slots hold at least one check, and how
--- many checks fell inside those slots. The difference between the two is the
--- number of runs beyond the first in a slot -- the duplicates that used to be
--- able to disguise a missed slot.
-slots AS (
-  SELECT
-    s.target_id                                        AS target_id,
-    COUNT(DISTINCT CAST((s.checked_at - ?4) / b.iv AS INTEGER)) AS slots_covered,
-    COUNT(*)                                           AS checks_in_slots
-  FROM scoped s
-  JOIN bounds b ON b.target_id = s.target_id
-  WHERE CAST((s.checked_at - ?4) / b.iv AS INTEGER)
-        BETWEEN b.first_slot AND b.last_slot
-  GROUP BY s.target_id
 )
 SELECT
   t.id                                   AS target_id,
@@ -113,25 +119,36 @@ SELECT
   COALESCE(a.failed_count, 0)            AS failed_count,
   a.first_checked_at                     AS first_checked_at,
   a.last_checked_at                      AS last_checked_at,
-  l.status                               AS last_status,
-  l.http_status                          AS last_http_status,
-  l.failure_kind                         AS last_failure_kind,
+  -- The newest check's own columns. ORDER BY checked_at DESC LIMIT 1 walks
+  -- (target_id, checked_at) backwards and stops on the first row, so each of
+  -- these reads one row rather than ranking the window. (target_id,
+  -- checked_at) is UNIQUE, so "the newest" is never ambiguous.
+  (SELECT c.status       FROM checks c
+     WHERE c.target_id = t.id AND c.checked_at >= ?1 AND c.checked_at <= ?2
+     ORDER BY c.checked_at DESC LIMIT 1) AS last_status,
+  (SELECT c.http_status  FROM checks c
+     WHERE c.target_id = t.id AND c.checked_at >= ?1 AND c.checked_at <= ?2
+     ORDER BY c.checked_at DESC LIMIT 1) AS last_http_status,
+  (SELECT c.failure_kind FROM checks c
+     WHERE c.target_id = t.id AND c.checked_at >= ?1 AND c.checked_at <= ?2
+     ORDER BY c.checked_at DESC LIMIT 1) AS last_failure_kind,
   a.interval_seconds                     AS interval_seconds,
   -- Expected ticks in the window at the cadence the data was collected at.
   -- Kept for backward compatibility: it is a count of SAMPLES, and it is the
   -- denominator coverage no longer uses.
   CAST((?2 - ?1) / COALESCE(a.interval_seconds, ?3) AS INTEGER) AS checks_expected,
   -- The coverage denominator: slots that fully ended inside the window.
-  CAST(MAX(b.last_slot - b.first_slot + 1, 0) AS INTEGER)       AS slots_expected,
-  CAST(COALESCE(sl.slots_covered, 0) AS INTEGER)                AS slots_covered,
+  CAST(MAX(
+    (CAST((?2 - ?4) / COALESCE(a.interval_seconds, ?3) AS INTEGER) - 1)
+    - CAST(((?1 - ?4) + COALESCE(a.interval_seconds, ?3) - 1) / COALESCE(a.interval_seconds, ?3) AS INTEGER)
+    + 1, 0) AS INTEGER)                  AS slots_expected,
+  CAST(COALESCE(a.slots_covered, 0) AS INTEGER)                 AS slots_covered,
   -- Runs beyond the first in a slot. Never negative: checks_in_slots counts the
   -- same rows slots_covered is distinct over.
-  CAST(COALESCE(sl.checks_in_slots, 0) - COALESCE(sl.slots_covered, 0) AS INTEGER) AS extra_runs
+  CAST(COALESCE(a.checks_in_slots, 0) - COALESCE(a.slots_covered, 0) AS INTEGER) AS extra_runs,
+  COALESCE(a.latency_samples, 0)         AS latency_samples
 FROM targets t
-LEFT JOIN agg    a  ON a.target_id  = t.id
-LEFT JOIN latest l  ON l.target_id  = t.id
-LEFT JOIN bounds b  ON b.target_id  = t.id
-LEFT JOIN slots  sl ON sl.target_id = t.id
+LEFT JOIN agg a ON a.target_id = t.id
 WHERE t.enabled = 1
 ORDER BY t.name
 `;
@@ -147,35 +164,78 @@ ORDER BY t.name
  * The gate is in SQL, not in the caller. Below MIN_SAMPLES the percentile
  * columns come back NULL and only the count is returned, so there is no code
  * path that can report a p95 derived from a dozen points.
+ *
+ * ONE window spec, not two. `ROW_NUMBER() OVER (...)` and `COUNT(*) OVER (...)`
+ * are different window definitions over the same partition, so SQLite sorted
+ * the window twice: measured 16,402 rows read where a single spec costs 8,201.
+ * The sample count now arrives from SUMMARY_SQL's grouped pass, which was
+ * already reading these rows, and is bound in through `{{WANT}}`.
+ *
+ * The rank arithmetic stays in SQL, derived from the bound `n`, so the
+ * definition of p50 and p95 lives in exactly one place and the caller cannot
+ * disagree with it. Values were compared against the previous form on all
+ * eight live targets and matched exactly.
+ *
+ * `{{WANT}}` is expanded by `latencySql(count)` into `(?4, ?5), (?6, ?7), ...`
+ * -- placeholders only. Targets with no samples are left out of the list
+ * entirely, which is what the previous form did implicitly by producing no
+ * group for them.
  */
 export const LATENCY_SQL = `
-WITH samples AS (
+WITH want0(target_id, n) AS (VALUES {{WANT}}),
+want AS (
+  SELECT
+    target_id,
+    n,
+    CAST((n - 1) * 0.50 AS INTEGER) + 1 AS p50_rn,
+    CAST((n - 1) * 0.95 AS INTEGER) + 1 AS p95_rn
+  FROM want0
+),
+samples AS (
   SELECT
     target_id,
     latency_ms,
-    ROW_NUMBER() OVER (PARTITION BY target_id ORDER BY latency_ms) AS rn,
-    COUNT(*)    OVER (PARTITION BY target_id)                      AS n
+    ROW_NUMBER() OVER (PARTITION BY target_id ORDER BY latency_ms) AS rn
   FROM checks
   WHERE checked_at >= ?1 AND checked_at <= ?2
     AND status = 'ok'
     AND latency_ms IS NOT NULL
-),
-ranked AS (
-  SELECT
-    target_id, latency_ms, rn, n,
-    CAST((n - 1) * 0.50 AS INTEGER) + 1 AS p50_rn,
-    CAST((n - 1) * 0.95 AS INTEGER) + 1 AS p95_rn
-  FROM samples
 )
 SELECT
-  target_id,
-  n AS sample_count,
-  CASE WHEN n >= ?3 THEN MAX(CASE WHEN rn = p50_rn THEN latency_ms END) END AS p50_ms,
-  CASE WHEN n >= ?3 THEN MAX(CASE WHEN rn = p95_rn THEN latency_ms END) END AS p95_ms,
-  CASE WHEN n >= ?3 THEN 0 ELSE 1 END                                       AS insufficient_data
-FROM ranked
-GROUP BY target_id, n
+  w.target_id                                                               AS target_id,
+  w.n                                                                       AS sample_count,
+  CASE WHEN w.n >= ?3 THEN MAX(CASE WHEN s.rn = w.p50_rn THEN s.latency_ms END) END AS p50_ms,
+  CASE WHEN w.n >= ?3 THEN MAX(CASE WHEN s.rn = w.p95_rn THEN s.latency_ms END) END AS p95_ms,
+  CASE WHEN w.n >= ?3 THEN 0 ELSE 1 END                                     AS insufficient_data
+FROM want w
+JOIN samples s
+  ON s.target_id = w.target_id
+ AND s.rn IN (w.p50_rn, w.p95_rn)
+GROUP BY w.target_id, w.n
 `;
+
+/** First bound parameter of the `{{WANT}}` list. ?1-?3 are since, now, gate. */
+const LATENCY_WANT_FIRST_PARAM = 4;
+
+/**
+ * Expand `{{WANT}}` for `count` targets.
+ *
+ * Generates placeholders and nothing else -- no caller value is interpolated.
+ * Throws on a count of zero rather than emitting `VALUES ()`, which is a
+ * syntax error: a window with no latency samples anywhere has no percentiles
+ * to ask for, and the caller must skip the query instead.
+ */
+export function latencySql(count: number): string {
+  if (!Number.isInteger(count) || count < 1) {
+    throw new Error(`latencySql needs at least one target, got ${count}`);
+  }
+  const rows: string[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const base = LATENCY_WANT_FIRST_PARAM + i * 2;
+    rows.push(`(?${base}, ?${base + 1})`);
+  }
+  return LATENCY_SQL.replace('{{WANT}}', rows.join(', '));
+}
 
 /**
  * Incidents, DERIVED - never stored.
@@ -202,12 +262,27 @@ GROUP BY target_id, n
  *   ongoing  - there is no later check at all
  *   unknown  - a later check exists but a gap sits between, so the moment
  *              recovery happened was never observed
+ *
+ * This is the most expensive query in the project -- 26,655 rows read against
+ * a 2,048-row window -- because LAG/LEAD have to walk every check in the
+ * window, not just the failed ones, to tell a continuing outage from a
+ * scheduler gap. It cannot be narrowed to failed ROWS without losing the
+ * neighbour each one is compared against.
+ *
+ * It CAN be narrowed to failed TARGETS, which `{{TARGETS}}` does. Every window
+ * function here partitions by target_id, so a target's results depend on no
+ * other target's rows; and a target with no failed check in the window
+ * contributes no row to `failures` and therefore no incident. Excluding those
+ * targets is exact, not approximate. The caller gets the list free: SUMMARY_SQL
+ * already counted `failed_count` per target in its own pass, and when that is
+ * zero everywhere this query is skipped entirely.
  */
 export const INCIDENTS_SQL = `
 WITH scoped AS (
   SELECT target_id, checked_at, status, failure_kind, failure_detail, interval_seconds
   FROM checks
   WHERE checked_at >= ?1 AND checked_at <= ?2
+    AND target_id IN ({{TARGETS}})
 ),
 seq AS (
   SELECT
@@ -269,6 +344,27 @@ ORDER BY first_failure_at DESC
 LIMIT ?4
 `;
 
+/** First bound parameter of `{{TARGETS}}`. ?1-?4 are since, now, gap, limit. */
+const INCIDENTS_TARGETS_FIRST_PARAM = 5;
+
+/**
+ * Expand `{{TARGETS}}` for `count` targets.
+ *
+ * Placeholders only; the ids themselves are bound by the caller. Throws on
+ * zero rather than emitting `IN ()`: a window with no failed check anywhere has
+ * no incidents to look for, and the caller must skip the query instead.
+ */
+export function incidentsSql(count: number): string {
+  if (!Number.isInteger(count) || count < 1) {
+    throw new Error(`incidentsSql needs at least one target, got ${count}`);
+  }
+  const holes: string[] = [];
+  for (let i = 0; i < count; i += 1) {
+    holes.push(`?${INCIDENTS_TARGETS_FIRST_PARAM + i}`);
+  }
+  return INCIDENTS_SQL.replace('{{TARGETS}}', holes.join(', '));
+}
+
 /**
  * Bucketed time series across all targets.
  *
@@ -295,6 +391,46 @@ LEFT JOIN checks c
  AND c.checked_at <  b.bucket_start + ?3
 GROUP BY b.bucket_start
 ORDER BY b.bucket_start
+`;
+
+/**
+ * The computed /summary payload, cached in the database.
+ *
+ * One row, read by primary key, so a cache HIT costs one row read instead of
+ * the ~21,000 a recomputation costs. The Cache API still sits in front of this
+ * and absorbs repeat traffic without touching D1 at all; this layer exists
+ * because that one is per-colo and therefore cannot bound how often the
+ * database is recomputed from.
+ *
+ * The slot and the version are both part of the match, so a payload is served
+ * only when it was computed in the current collection slot AND under the
+ * current response shape. Anything else misses and is recomputed.
+ */
+export const SUMMARY_CACHE_GET_SQL = `
+SELECT payload, computed_at
+FROM summary_cache
+WHERE id = 1 AND version = ?1 AND slot_start = ?2
+`;
+
+export const SUMMARY_CACHE_PUT_SQL = `
+INSERT OR REPLACE INTO summary_cache (id, version, slot_start, payload, computed_at)
+VALUES (1, ?1, ?2, ?3, ?4)
+`;
+
+/**
+ * The watchdog's two questions, each answered by one row.
+ *
+ * These were a single statement -- MAX(checked_at) together with a
+ * SUM(CASE ...) over the same table -- and the SUM forced a full pass: SQLite
+ * can satisfy a bare MAX() from the tail of an index, but not a MAX beside a
+ * conditional count. Measured, that one statement read 13,512 rows on every
+ * tick, 144 times a day, and grew by ~370 rows a day as history accumulated.
+ * Split apart, each reads a single row and neither grows.
+ */
+export const WATCHDOG_LAST_CHECK_SQL = `SELECT MAX(checked_at) AS last FROM checks`;
+
+export const WATCHDOG_SLOT_FILLED_SQL = `
+SELECT EXISTS(SELECT 1 FROM checks WHERE checked_at >= ?1) AS in_slot
 `;
 
 /** Targets, for the ingest validator to check membership against. */

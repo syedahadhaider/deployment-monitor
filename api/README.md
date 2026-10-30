@@ -5,7 +5,7 @@ aggregation is SQL.
 
 ```
 POST /ingest         bearer auth, validates and rejects, parameterised writes
-GET  /summary        public, cached 600s, fully aggregated
+GET  /summary        public, cached (edge 600s + a global cache in D1), fully aggregated
 POST /watchdog/run   bearer auth, runs the watchdog now and reports its decision
 GET  /health         liveness
 ```
@@ -53,8 +53,12 @@ addition to the originally sketched schema; everything else matches.)*
 `targets` has no index: it holds one row per monitored site (eight), which
 SQLite scans faster than it could consult an index.
 
-Verified with `EXPLAIN QUERY PLAN` against 20,000 rows — **no query full-scans
-`checks`**:
+`api/explain_plans.py` is the gate for this: it builds a production-sized
+replica from these migrations, runs `ANALYZE`, and **fails if any shipped query
+plans as a `SCAN` of `checks`** — including a `SCAN ... USING COVERING INDEX`,
+which reads every entry in the index and so costs the whole table. It runs as
+section 15 of `verify_sql.py`, so the gate cannot be forgotten.
+
 
 ```
 SUMMARY/LATENCY/INCIDENTS  SEARCH checks USING INDEX idx_checks_target_time
@@ -159,19 +163,33 @@ Verified against the running Worker:
 | `'; DROP TABLE checks;--` as target_id | `400` unknown target (and bound, never interpolated) |
 | replayed batch | `{"received":8,"inserted":0,"duplicates_ignored":8}` |
 
-## Read API and the cache TTL
+## Read API and caching
 
-`/summary` is public and cached for **600 seconds**.
+`/summary` is cached twice, and the second layer is the one that matters.
 
-Checks arrive every 30 minutes, so a shorter TTL would mostly re-run the same
-aggregation over identical rows. Ten minutes bounds worst-case staleness to a
-third of the collection interval while capping origin hits at 144/day per edge
-location.
+| Layer | Scope | Period | Cost of a hit |
+| --- | --- | --- | --- |
+| Cache API | **per colo** | 600s | nothing — never reaches the Worker's database |
+| `summary_cache` table | **global** | 2 collection slots (1 hour) | 1 row read |
 
-That cap matters for correctness, not just speed: since **1 September 2026**
-D1 *fails* queries once the free tier's daily row limit is reached, and because
-the limit is account-wide that failure would take the collector's **writes**
-down with it. The TTL is a safety margin.
+The edge cache alone cannot bound how often the summary is recomputed, because
+it is per colo: every colo that serves a request misses its own copy and
+recomputes. The README used to budget as though it capped origin hits at
+144/day; it caps them at 144/day **per edge location**, and the difference is
+what exhausted this account's daily read quota and, with it, the collector's
+ability to write. The D1-backed layer is the global backstop — one row, read by
+primary key, shared by every colo.
+
+Keyed on the slot grid rather than a wall clock, because the collector writes
+one batch per slot: recomputing inside a period spends quota to produce a
+byte-identical answer. Two slots rather than one is an arithmetic choice, set
+out in `SUMMARY_CACHE_SLOTS` in `src/index.ts`.
+
+That matters for correctness, not just speed: since **1 September 2026** D1
+*fails* queries once the free tier's daily row limit is reached, and because
+the limit is account-wide that failure takes the collector's **writes** down
+with it. This is not hypothetical — it is what happened here daily from 19
+October, losing about a third of each day's runs.
 
 A D1 error — including that limit — returns `503` with
 `"monitor data is temporarily unavailable"` and `Cache-Control: no-store`. It
@@ -179,23 +197,67 @@ never degrades into a page implying every site is down.
 
 ## D1 free tier budget
 
-Confirmed 2026-09-24 from Cloudflare's pricing page:
+Rows **read** is the binding constraint. Everything below is measured, not
+projected: D1 returns `meta.rows_read` per statement, so each figure is one
+call against the live database on 2026-10-30, with 13,512 rows in `checks` and
+2,048 in the 7-day window.
 
-| Free tier | Limit | Projected use |
+| Free tier | Limit | Use |
 | --- | --- | --- |
-| Rows written | 100,000 / day | 8 targets × 48 checks = **384/day (0.4%)** |
-| Rows read | 5,000,000 / day | **~13,400 per uncached `/summary`** |
+| Rows written | 100,000 / day | 8 targets × 48 slots = **384/day (0.4%)** |
+| Rows read | 5,000,000 / day | **~499,000/day (10%)** — see below |
 | Storage | 5 GB account, 500 MB / database | ~17 MB/year |
 
-The read figure is the binding constraint, so it is the one that was designed
-against. 2,688 rows fall in a 7-day window; the four statements scan that range
-via index (never the table), giving ≈13,400 rows per uncached request — about
-**370 uncached requests/day** of headroom, against a cache that admits at most
-144/day per edge location.
+Per call, before and after this pass:
 
-If traffic ever outgrew that, the fix is a rollup table maintained on write
-rather than a bigger plan; read-time aggregation is kept here because
-demonstrating the queries is the point of the project.
+| Statement | Before | After |
+| --- | --- | --- |
+| `SUMMARY_SQL` | 33,884 | **4,159** |
+| `LATENCY_SQL` | 16,402 | **12,320** |
+| `SERIES_SQL` | 4,270 | 4,270 |
+| `INCIDENTS_SQL` | 26,655 | **0** when the window holds no failure; 3,083 per failing target |
+| watchdog freshness, per tick | 13,512 | **2** |
+| `/summary` cache hit | — | **1** |
+
+A day, at the 48-slot collection cadence:
+
+| | Before | After |
+| --- | --- | --- |
+| watchdog, 144 ticks | 1,945,728 | 288 |
+| `/summary` recomputations | 57 × 81,211 = 4,629,027 | 24 × 20,750 = 498,000 |
+| ingest writes + target validation | ~1,150 | ~1,150 |
+| **total** | **~6,576,000 (132% of the limit)** | **~499,000 (10%)** |
+
+The "before" total agrees with `wrangler d1 insights` over the preceding seven
+days, which recorded 44,633,399 rows read — 6,376,200/day.
+
+**The figure no longer grows with the table.** Every statement is bounded by the
+7-day window, and the watchdog reads two rows whatever the history. Before this
+pass the watchdog alone added ~53,000 rows/day to the daily cost for every day
+the collector ran, which is why the failures started near midnight in October
+and had moved to mid-afternoon within a week.
+
+## Retention — proposed, not implemented
+
+**Delete checks older than 90 days**, from the existing scheduled handler.
+
+At 384 rows/day that caps `checks` near **34,560 rows** and storage near 4 MB,
+against an unbounded ~140,000 rows and ~17 MB a year.
+
+Two honest caveats on the recommendation:
+
+- **It is not what fixes the quota, and must not be sold as that.** After this
+  pass no query's cost depends on the table size, so deleting history saves
+  nothing on reads. The reason to do it is storage and planner statistics, not
+  the daily allowance. Had retention been applied *instead* of these changes,
+  the watchdog would still have scanned 34,560 rows every ten minutes — 5
+  million a day on its own, the entire allowance.
+- **90 days keeps more than anything reads.** The dashboard window is 7 days and
+  no query looks further back, so 90 days is for being able to answer questions
+  about the past by hand, with ~13× headroom over what is actually queried.
+
+Deliberately not done in this pass: it deletes data, which deserves its own
+review rather than riding along with a read-volume fix.
 
 ## Local development
 

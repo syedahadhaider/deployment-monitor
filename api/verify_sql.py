@@ -40,6 +40,60 @@ def sql(name: str) -> str:
     return match.group(1)
 
 
+def incidents_targets_first_param() -> int:
+    """Read INCIDENTS_TARGETS_FIRST_PARAM out of queries.ts, same as above."""
+    match = re.search(r"INCIDENTS_TARGETS_FIRST_PARAM = (\d+)", QUERIES)
+    if not match:
+        raise SystemExit("could not find INCIDENTS_TARGETS_FIRST_PARAM in queries.ts")
+    return int(match.group(1))
+
+
+def latency_want_first_param() -> int:
+    """Read LATENCY_WANT_FIRST_PARAM out of queries.ts.
+
+    Mirrored rather than hardcoded so the Python expansion below cannot drift
+    from the TypeScript one if the parameter order ever changes.
+    """
+    match = re.search(r"LATENCY_WANT_FIRST_PARAM = (\d+)", QUERIES)
+    if not match:
+        raise SystemExit("could not find LATENCY_WANT_FIRST_PARAM in queries.ts")
+    return int(match.group(1))
+
+
+def latency_sql(count: int) -> str:
+    """Expand LATENCY_SQL's `{{WANT}}` exactly as `latencySql(count)` does.
+
+    One `(?i, ?i+1)` pair per target, numbered from LATENCY_WANT_FIRST_PARAM.
+    The shipped text is still the tested text: only the placeholder list is
+    generated, and the generated part contains nothing but placeholders.
+    """
+    if count < 1:
+        raise SystemExit("latency_sql needs at least one target")
+    first = latency_want_first_param()
+    rows = [f"(?{first + i * 2}, ?{first + i * 2 + 1})" for i in range(count)]
+    return sql("LATENCY_SQL").replace("{{WANT}}", ", ".join(rows))
+
+
+def latency_rows(con: sqlite3.Connection, since: int, until: int) -> list[sqlite3.Row]:
+    """Run the two phases the Worker runs: count in SUMMARY, then rank.
+
+    The sample count reaches LATENCY_SQL as a bound parameter rather than being
+    recomputed inside it, which is what lets it use a single window spec. This
+    helper keeps the test honest about that: it takes the count from
+    SUMMARY_SQL's own output, exactly as the Worker does.
+    """
+    summary = con.execute(
+        sql("SUMMARY_SQL"), (since, until, INTERVAL, SLOT_PHASE)
+    ).fetchall()
+    wanted = [(r["target_id"], r["latency_samples"]) for r in summary if r["latency_samples"] > 0]
+    if not wanted:
+        return []
+    params: list[object] = [since, until, MIN_SAMPLES]
+    for target_id, n in wanted:
+        params.extend([target_id, n])
+    return con.execute(latency_sql(len(wanted)), tuple(params)).fetchall()
+
+
 def check(label: str, got: object, want: object) -> None:
     if got == want:
         print(f"  PASS  {label}")
@@ -80,7 +134,22 @@ def summary(con: sqlite3.Connection, since: int, until: int) -> list[sqlite3.Row
 
 
 def incidents(con: sqlite3.Connection, since: int, until: int) -> list[sqlite3.Row]:
-    return con.execute(sql("INCIDENTS_SQL"), (since, until, GAP_TOLERANCE, 50)).fetchall()
+    # Mirrors the Worker: the failing targets come from the data, and the
+    # query is not run at all when there are none.
+    failing = [
+        row[0]
+        for row in con.execute(
+            "SELECT DISTINCT target_id FROM checks"
+            " WHERE checked_at >= ? AND checked_at <= ? AND status = 'failed'"
+            " ORDER BY target_id",
+            (since, until),
+        ).fetchall()
+    ]
+    if not failing:
+        return []
+    holes = ", ".join(f"?{incidents_targets_first_param() + i}" for i in range(len(failing)))
+    text = sql("INCIDENTS_SQL").replace("{{TARGETS}}", holes)
+    return con.execute(text, (since, until, GAP_TOLERANCE, 50, *failing)).fetchall()
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +257,8 @@ check("expected comes from the cadence", row["checks_expected"], 24)
 check("and so does the slot expectation", row["slots_expected"], 24)
 check("ok count", row["ok_count"], 9)
 check("failed count", row["failed_count"], 3)
-check("uptime is of checks that RAN (9/12)", round(row["ok_count"] / row["checks_recorded"], 4), 0.75)
+check("uptime is of checks that RAN (9/12)",
+      round(row["ok_count"] / row["checks_recorded"], 4), 0.75)
 check("coverage is a separate fraction (12/24)",
       round(row["slots_covered"] / row["slots_expected"], 4), 0.5)
 
@@ -202,7 +272,7 @@ print("\n7. percentiles are gated below the minimum sample count")
 con = fresh()
 for i in range(10):
     add(con, "a", t + i * INTERVAL, "ok", 100 + i)
-rows = con.execute(sql("LATENCY_SQL"), (t, t + 100 * INTERVAL, MIN_SAMPLES)).fetchall()
+rows = latency_rows(con, t, t + 100 * INTERVAL)
 check("sample count is reported", rows[0]["sample_count"], 10)
 check("p50 withheld below the gate", rows[0]["p50_ms"], None)
 check("p95 withheld below the gate", rows[0]["p95_ms"], None)
@@ -213,7 +283,7 @@ for i in range(100):  # latencies 1..100
     add(con, "a", t + i * INTERVAL, "ok", i + 1)
 # a failed check must not enter the latency distribution at all
 add(con, "a", t + 200 * INTERVAL, "failed", kind="timeout")
-rows = con.execute(sql("LATENCY_SQL"), (t, t + 300 * INTERVAL, MIN_SAMPLES)).fetchall()
+rows = latency_rows(con, t, t + 300 * INTERVAL)
 check("only successful checks are sampled", rows[0]["sample_count"], 100)
 check("p50 of 1..100 (nearest rank)", rows[0]["p50_ms"], 50)
 check("p95 of 1..100 (nearest rank)", rows[0]["p95_ms"], 95)
@@ -351,6 +421,25 @@ check("...which is 0% coverage, and that is the honest figure",
 check("...and no phantom extra runs", b_row["extra_runs"], 0)
 
 print()
+# ---------------------------------------------------------------------------
+print("\n15. every shipped query is bounded by the window, not by the table")
+# ---------------------------------------------------------------------------
+# D1 bills rows SCANNED and refuses queries once the daily allowance is gone,
+# which takes the collector's WRITES down with the dashboard's reads. A query
+# that scans `checks` therefore gets more expensive every day until a normal
+# day breaks the service -- so "no full scan of checks" is a correctness
+# assertion here, not a performance preference. The plans are checked against a
+# production-sized replica, because SQLite will rightly scan a table of twelve
+# rows whatever indexes exist.
+#
+# sys.path is extended explicitly so this works under `python -I`, which does
+# not put the script's own directory on the path.
+sys.path.insert(0, str(HERE))
+import explain_plans  # noqa: E402
+
+scanning = explain_plans.scan_failures()
+check("no shipped query scans the checks table", scanning, [])
+
 if failures:
     print(f"{len(failures)} FAILURE(S)")
     sys.exit(1)

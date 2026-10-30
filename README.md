@@ -24,7 +24,7 @@ Python collector ──authenticated HTTPS POST──▶ Worker /ingest
                                                    D1
                                                     │  SQL aggregation
                                                     ▼
-                          Next.js page ◀──fetch── Worker /summary (cached 600s)
+                          Next.js page ◀──fetch── Worker /summary (cached: edge 600s, D1 1h)
 ```
 
 The portfolio does a plain `fetch` against a public read endpoint and renders
@@ -74,7 +74,8 @@ being reported as one long outage across a period nobody observed.
 - [`collector/README.md`](collector/README.md) — failure classification, retry
   semantics, isolation, and the operational realities of Actions cron.
 - [`api/README.md`](api/README.md) — schema, indexes and why each exists, the
-  incident-derivation SQL, validation, cache TTL, and the D1 free-tier budget.
+  incident-derivation SQL, validation, the two cache layers, the measured D1
+  read budget and the retention proposal.
 
 ## Setup
 
